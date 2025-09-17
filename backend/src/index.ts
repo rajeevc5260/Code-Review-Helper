@@ -1,6 +1,6 @@
 import express from "express";
 import dotenv from "dotenv";
-import { pool } from "./client.js";
+import { db, pool } from "./client.js";
 import { namespace, trelae } from "./trelae.js";
 import { z } from "zod";
 import { writeFile, readFile, rm } from "fs/promises";
@@ -12,11 +12,16 @@ import {
     type FunctionDeclaration,
     FunctionCallingConfigMode,
 } from "@google/genai";
+import { eq, and } from 'drizzle-orm';
+import { reviewZip } from "./db/schema.js";
 
 dotenv.config();
-
+import cors from "cors";
 const app = express();
 app.use(express.json());
+app.use(cors({
+    origin: "*",
+}))
 const PORT = Number(process.env.PORT || 3000);
 
 app.get("/", (_req, res) => {
@@ -280,76 +285,119 @@ const fnReadFileText: FunctionDeclaration = {
 };
 
 // POST review 
-app.post("/ai/review", async (req, res) => {
-    console.log("🚀 Starting AI review request");
-    console.log("📥 Request body:", JSON.stringify(req.body, null, 2));
+app.post("/ai/review/stream", async (req, res) => {
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    // Keep the socket open
+    req.socket.setTimeout(0);
+    res.flushHeaders?.();
 
-    const parsed = ReviewBody.safeParse(req.body);
-    if (!parsed.success) {
-        console.error(" Invalid request body:", parsed.error.flatten());
-        return res.status(400).json({
-            error: "invalid_body",
-            issues: parsed.error.flatten(),
+    // utility helpers
+    const send = (event: string, data: any) => {
+        // SSE format: event:<name>\n data:<json>\n\n
+        const payload = typeof data === "string" ? data : JSON.stringify(data);
+        res.write(`event: ${event}\n`);
+        res.write(`data: ${payload}\n\n`);
+    };
+    const sendProgress = (message: string, details?: any) =>
+        send("progress", {
+            timestamp: Date.now(),
+            message,
+            status: "processing",
+            ...(details ?? {})
         });
-    }
+    const sendError = (message: string, details?: any) =>
+        send("error", {
+            timestamp: Date.now(),
+            message,
+            status: "error",
+            ...(details ?? {})
+        });
 
-    const { userId, zipFileId, message } = parsed.data;
-    console.log(" Request validated:", { userId, zipFileId, messageLength: message.length });
+    // heartbeat to keep connections alive (esp. behind proxies)
+    const hb = setInterval(() => res.write(`: ping ${Date.now()}\n\n`), 15000);
 
-    if (!process.env.GEMINI_API_KEY) {
-        console.error(" Missing GEMINI_API_KEY");
-        return res.status(500).json({ error: "missing_gemini_api_key" });
-    }
-
-    // 1) fetch saved folder_structure for extra context (best-effort)
-    console.log("🗄️ Fetching folder structure from database...");
-    let folderStructure: any = null;
     try {
-        const r = await pool.query(
-            `SELECT folder_structure FROM review_zip WHERE zip_file_id = $1 AND user_id = $2 LIMIT 1`,
-            [zipFileId, userId]
-        );
-        if (r.rowCount) {
-            folderStructure = r.rows[0].folder_structure;
-            console.log(" Folder structure found:", {
-                hasStructure: !!folderStructure,
-                structureSize: JSON.stringify(folderStructure).length
+        send("start", {
+            message: "Initializing AI code review session",
+            timestamp: Date.now(),
+            status: "started"
+        });
+
+        const parsed = ReviewBody.safeParse(req.body);
+        if (!parsed.success) {
+            sendError("Request validation failed - Invalid request body format", {
+                validationErrors: parsed.error.flatten()
             });
-        } else {
-            console.log("📂 No folder structure found in database");
+            send("done", { status: "failed", timestamp: Date.now() });
+            return res.end();
         }
-    } catch (dbError) {
-        console.warn(" Database query failed (continuing anyway):", dbError);
-    }
+        const { userId, zipFileId, message } = parsed.data;
+        sendProgress("Request validated successfully", {
+            userId,
+            zipFileId,
+            messageLength: message.length
+        });
 
-    // 2) init Gen AI
-    console.log("🤖 Initializing Google GenAI...");
-    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+        if (!process.env.GEMINI_API_KEY) {
+            sendError("Configuration error - Missing Gemini API key");
+            send("done", { status: "failed", timestamp: Date.now() });
+            return res.end();
+        }
 
-    // 3) temp workspace for downloads
-    const tempRoot = path.resolve("src/lib/review-tmp");
-    console.log(`📁 Setting up temp workspace: ${tempRoot}`);
-    await fsPromises.mkdir(tempRoot, { recursive: true });
+        // fetch saved folder_structure for extra context (best-effort)
+        console.log("🗄️ Fetching folder structure from database...");
+        let folderStructure: any = null;
+        try {
+            sendProgress("Retrieving project structure from database");
+            const r = await pool.query(
+                `SELECT folder_structure FROM review_zip WHERE zip_file_id = $1 AND user_id = $2 LIMIT 1`,
+                [zipFileId, userId]
+            );
+            if (r.rowCount) {
+                folderStructure = r.rows[0].folder_structure;
+                send("folder_structure", {
+                    status: "found",
+                    timestamp: Date.now(),
+                    message: "Project structure loaded successfully"
+                });
+            } else {
+                send("folder_structure", {
+                    status: "not_found",
+                    timestamp: Date.now(),
+                    message: "No saved project structure found - will analyze files directly"
+                });
+            }
+        } catch (e: any) {
+            sendError("Database query failed while fetching project structure", {
+                error: e?.message || String(e)
+            });
+        }
 
-    const toolLogs: any[] = [];
-    const gatheredTexts: Array<{
-        fileId: string;
-        name: string;
-        bytes: number;
-        truncated: boolean;
-        text: string;
-    }> = [];
+        // init Gen AI
+        console.log("🤖 Initializing Google GenAI...");
+        sendProgress("Initializing AI analysis engine");
+        const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+        const tempRoot = path.resolve("src/lib/review-tmp");
+        await fsPromises.mkdir(tempRoot, { recursive: true });
+        sendProgress("Workspace prepared successfully", { workspaceLocation: tempRoot });
 
-    try {
+        const toolLogs: any[] = [];
+        const gatheredTexts: Array<{
+            fileId: string; name: string; bytes: number; truncated: boolean; text: string;
+        }> = [];
+
         const sysPrompt =
             `You are a code analysis assistant. Your job is to directly answer the user's specific question or request about the code.\n` +
             `Use the available tools to explore files and gather information needed to provide a precise, direct answer.\n` +
             `Focus on reading the most relevant files based on the user's query. Provide specific, actionable responses rather than general summaries.\n` +
             `If the user asks about specific functionality, bugs, improvements, or code patterns, give exact answers with code examples where appropriate.`;
-            
+
         const fsSummary = folderStructure
             ? `Folder structure (JSON):\n${JSON.stringify(folderStructure).slice(0, 5000)}`
-            : `No saved folder structure found for this zipFileId.`
+            : `No saved folder structure found for this zipFileId.`;
 
         console.log("📝 Preparing conversation history...");
         const history: any[] = [
@@ -358,156 +406,241 @@ app.post("/ai/review", async (req, res) => {
             { role: "user", parts: [{ text: fsSummary }] },
         ];
 
-        console.log("Making initial request to GenAI with tools enabled...");
-        // First ask with tools enabled
+        sendProgress("Starting AI analysis of your codebase");
+
         let response = await ai.models.generateContent({
             model: "gemini-2.0-flash-001",
             contents: history,
             config: {
-                tools: [
-                    {
-                        functionDeclarations: [fnListFiles, fnGetDownloadUrl, fnReadFileText],
-                    },
-                ],
-                toolConfig: {
-                    functionCallingConfig: {
-                        mode: FunctionCallingConfigMode.AUTO,
-                    },
-                },
+                tools: [{ functionDeclarations: [fnListFiles, fnGetDownloadUrl, fnReadFileText] }],
+                toolConfig: { functionCallingConfig: { mode: FunctionCallingConfigMode.AUTO } },
             },
         });
 
-        console.log(" Initial GenAI response received");
-
-        // Tool-calling loop (max 10 rounds)
-        console.log("🔄 Starting tool-calling loop (max 10 rounds)...");
+        // tool-calling loop (max 10 rounds)
         for (let i = 0; i < 10; i++) {
             const calls = response.functionCalls ?? [];
-            console.log(`🔄 Round ${i + 1}: Found ${calls.length} function calls`);
+            sendProgress(`Analysis round ${i + 1} - Processing ${calls.length} operations`, {
+                round: i + 1,
+                operationsCount: calls.length
+            });
 
             if (!calls.length) {
-                console.log(" No more function calls - loop complete");
+                sendProgress("Analysis complete - No additional operations required");
                 break;
             }
 
             const fnCall = calls[0];
             const { name, args } = fnCall;
-            console.log(`🛠️ Executing tool: ${name}`, JSON.stringify(args, null, 2));
 
+            const t0 = Date.now();
             let result: any;
-            const toolStartTime = Date.now();
-
             try {
                 if (name === "listFiles") {
+                    send("directory_scan_started", {
+                        timestamp: Date.now(),
+                        message: "Scanning project directory structure",
+                        parameters: args
+                    });
                     result = await listFilesTool(args);
+                    const ms = Date.now() - t0;
+                    toolLogs.push({ name, args, result, duration: ms });
+                    send("directory_scan_complete", {
+                        durationMs: ms,
+                        timestamp: Date.now(),
+                        message: `Directory scan completed in ${ms}ms`,
+                        summary: summarizeToolResult(result)
+                    });
                 } else if (name === "getDownloadUrl") {
+                    send("file_access_started", {
+                        timestamp: Date.now(),
+                        message: "Retrieving file access permissions",
+                        parameters: args
+                    });
                     result = await getDownloadUrlTool(args);
+                    const ms = Date.now() - t0;
+                    toolLogs.push({ name, args, result, duration: ms });
+                    send("file_access_complete", {
+                        durationMs: ms,
+                        timestamp: Date.now(),
+                        message: `File access granted in ${ms}ms`,
+                        summary: summarizeToolResult(result)
+                    });
                 } else if (name === "readFileText") {
+                    send("file_analysis_started", {
+                        timestamp: Date.now(),
+                        message: "Reading and analyzing file content",
+                        parameters: args
+                    });
                     const out = await readFileTextTool(args, tempRoot);
                     result = out;
-                    // Only push to gatheredTexts if out is a successful result (has text, name, fileId, bytes)
-                    if (
-                        out &&
-                        typeof out === "object" &&
-                        "text" in out &&
-                        "name" in out &&
-                        "fileId" in out &&
-                        "bytes" in out
-                    ) {
+                    if (out && typeof out === "object" && "text" in out) {
                         gatheredTexts.push({
-                            fileId: out.fileId,
-                            name: out.name,
-                            bytes: out.bytes,
-                            truncated: !!out.truncated,
-                            text: out.text,
+                            fileId: out.fileId, name: out.name, bytes: out.bytes,
+                            truncated: !!out.truncated, text: out.text,
                         });
-                        console.log(`📚 Added text file to gathered texts: ${out.name} (${out.bytes} bytes)`);
                     }
+                    const ms = Date.now() - t0;
+                    toolLogs.push({ name, args, result, duration: ms });
+                    send("file_analysis_complete", {
+                        fileName: out?.name || "unknown",
+                        fileSizeBytes: out?.bytes || 0,
+                        contentTruncated: !!out?.truncated,
+                        durationMs: ms,
+                        timestamp: Date.now(),
+                        message: `File analysis completed for ${out?.name || "file"} (${out?.bytes || 0} bytes) in ${ms}ms`
+                    });
                 } else {
-                    console.error(` Unknown tool: ${name}`);
                     result = { error: `unknown_tool: ${name}` };
+                    send("operation_error", {
+                        timestamp: Date.now(),
+                        message: `Unknown operation requested: ${name}`,
+                        operation: name
+                    });
                 }
             } catch (err: any) {
-                console.error(` Tool execution error for ${name}:`, err);
-                result = { error: err?.message || String(err) };
+                const ms = Date.now() - t0;
+                toolLogs.push({ name, args, error: err?.message || String(err), duration: ms });
+                const operationType = name === "listFiles" ? "directory_scan" :
+                    name === "getDownloadUrl" ? "file_access" :
+                        name === "readFileText" ? "file_analysis" : "operation";
+                sendError(`${operationType.replace('_', ' ')} failed after ${ms}ms`, {
+                    operation: name,
+                    operationType,
+                    durationMs: ms,
+                    error: err?.message || String(err)
+                });
             }
 
-            const toolDuration = Date.now() - toolStartTime;
-            console.log(`⏱️ Tool ${name} completed in ${toolDuration}ms`);
+            // Feed result back
+            history.push({ role: "model", parts: [{ functionCall: { name, args } }] });
+            history.push({ role: "tool", parts: [{ functionResponse: { name, response: result } }] });
 
-            const logEntry = { name, args, result, duration: toolDuration };
-            toolLogs.push(logEntry);
-            console.log("📝 Tool call logged:", { name, duration: toolDuration, hasResult: !!result });
-
-            // Feed function response back into the conversation
-            console.log("🔄 Updating conversation history with tool results...");
-            history.push({
-                role: "model",
-                parts: [{ functionCall: { name, args } }],
-            });
-            history.push({
-                role: "tool",
-                parts: [{ functionResponse: { name, response: result } }],
-            });
-
-            console.log("🤖 Making follow-up request to GenAI...");
-            // Ask the model again with the updated history
+            sendProgress("Continuing analysis with gathered information");
             response = await ai.models.generateContent({
                 model: "gemini-2.0-flash-001",
                 contents: history,
                 config: {
-                    tools: [
-                        {
-                            functionDeclarations: [fnListFiles, fnGetDownloadUrl, fnReadFileText],
-                        },
-                    ],
-                    toolConfig: {
-                        functionCallingConfig: {
-                            mode: FunctionCallingConfigMode.AUTO,
-                        },
-                    },
+                    tools: [{ functionDeclarations: [fnListFiles, fnGetDownloadUrl, fnReadFileText] }],
+                    toolConfig: { functionCallingConfig: { mode: FunctionCallingConfigMode.AUTO } },
                 },
             });
-
-            console.log(` Follow-up GenAI response received for round ${i + 1}`);
         }
 
-        const finalText = response.text ?? "Done.";
-        console.log("🎉 AI review completed successfully");
-        console.log("📊 Final stats:", {
-            toolCallsCount: toolLogs.length,
-            gatheredFilesCount: gatheredTexts.length,
-            responseLength: finalText.length
+        const finalText = response.text ?? "Analysis completed.";
+
+        // Format the final response as markdown
+        const markdownResponse = `# Code Review Analysis
+        
+        ${finalText}
+
+        ---
+        *Analysis completed at ${new Date().toISOString()}*`;
+
+        send("analysis_result", {
+            timestamp: Date.now(),
+            message: markdownResponse
         });
 
-        return res.json({
-            ok: true,
-            response: finalText,
-            selectedFiles: gatheredTexts.map((g) => ({
+        send("review_summary", {
+            totalOperations: toolLogs.length,
+            filesAnalyzed: gatheredTexts.length,
+            responseLength: finalText.length,
+            timestamp: Date.now(),
+            message: `Review completed - Analyzed ${gatheredTexts.length} files with ${toolLogs.length} operations`,
+            analyzedFiles: gatheredTexts.map(g => ({
                 fileId: g.fileId,
-                name: g.name,
-                bytes: g.bytes,
-                truncated: g.truncated,
+                fileName: g.name,
+                fileSizeBytes: g.bytes,
+                contentTruncated: g.truncated
             })),
-            snippets: gatheredTexts.map((g) => ({
-                name: g.name,
-                excerpt: g.text.slice(0, 2000),
-            })),
-            toolLogs,
         });
+
+        // // cleanup
+        // try {
+        //     await rm(tempRoot, { recursive: true, force: true });
+        //     sendProgress("Workspace cleanup completed successfully");
+        // } catch (e: any) {
+        //     sendError("Workspace cleanup failed", {
+        //         error: e?.message || String(e)
+        //     });
+        // }
+
+        send("finished", {
+            status: "success",
+            timestamp: Date.now(),
+            message: "Code review session completed successfully"
+        });
+        res.end();
     } catch (e: any) {
-        console.error("AI review failed:", e);
-        return res.status(500).json({
-            ok: false,
-            error: e?.message || String(e),
+        sendError("Critical error occurred during code review", {
+            error: e?.message || String(e)
         });
+        send("finished", {
+            status: "failed",
+            timestamp: Date.now(),
+            message: "Code review session failed due to critical error"
+        });
+        res.end();
     } finally {
-        console.log("Cleaning up temp workspace...");
-        await rm(tempRoot, { recursive: true, force: true }).catch((cleanupError) => {
-            console.warn(" Failed to cleanup temp workspace:", cleanupError);
-        });
-        console.log("Cleanup completed");
+        clearInterval(hb);
     }
+});
+
+// Small helper to avoid dumping giant payloads in SSE
+function summarizeToolResult(result: any) {
+    if (!result) return null;
+    if (result.error) return { error: String(result.error) };
+    if (result.files || result.folders || result.total) {
+        return {
+            filesCount: result.files?.length || 0,
+            foldersCount: result.folders?.length || 0,
+            total: result.total ?? undefined,
+            page: result.page ?? undefined,
+        };
+    }
+    if (result.downloadUrl) {
+        return { downloadUrlLength: result.downloadUrl.length };
+    }
+    if (result.text && result.name) {
+        return { name: result.name, bytes: result.bytes, truncated: !!result.truncated };
+    }
+    return Object.keys(result).slice(0, 5);
+}
+
+
+const Body = z.object({
+    userId: z.string().min(1),
+    zipFileId: z.string().min(1),
+    folderStructure: z.any(),
+});
+
+app.post("/review-zip", async (req, res) => {
+    const parsed = Body.safeParse(req.body);
+    if (!parsed.success) {
+        return res
+            .status(400)
+            .json({ error: "Invalid body", details: parsed.error.flatten() });
+    }
+
+    const { userId, zipFileId, folderStructure } = parsed.data;
+
+    const existing = await db
+        .select({ id: reviewZip.id })
+        .from(reviewZip)
+        .where(and(eq(reviewZip.userId, userId), eq(reviewZip.zipFileId, zipFileId)))
+        .limit(1);
+
+    if (existing.length) {
+        return res
+            .status(409)
+            .json({ error: "Already exists for this userId + zipFileId" });
+    }
+
+    const id = randomUUID();
+    await db.insert(reviewZip).values({ id, userId, zipFileId, folderStructure });
+
+    return res.status(201).json({ id, userId, zipFileId });
 });
 
 app.listen(PORT, () => {
