@@ -1,11 +1,21 @@
 <script lang="ts">
+	import { Trelae } from 'trelae-files';
+  import { tick } from 'svelte';
+
+  //  values supplied by +page.server.ts
+  export let data: { userId: string; backendUrl: string };
+  let backendUrl: string = data.backendUrl;
+  let userId: string = data.userId;
+
+  console.log('[AI Code Reviewer] backendUrl:', backendUrl, 'userId:', userId);
+
   let file: File | null = null;
 
   // Upload state
   let uploading = false;
   let uploadMsg: string | null = null;
   let uploadedFileId: string | null = null;
-  let uploadPct = 0;               // NEW: upload progress %
+  let uploadPct = 0;
 
   // Extraction / listing state
   let extracting = false;
@@ -17,12 +27,12 @@
   let verifying = false;
   let verifySpinnerTick = 0;
 
-  // NEW: zip base name (folder inside extracted location)
+  // zip base name (folder inside extracted location)
   let zipBase = '';
 
   // Manual list inputs
   let listLocation = '';
-  let listLimit = 100;   // Trelae max per page = 100
+  let listLimit = 100;
   let listPage = 1;
   let listBusy = false;
   let listMsg: string | null = null;
@@ -38,35 +48,24 @@
     _err?: string;
   };
 
-  type TPagination = {
-    limit: number;
-    page:number
-  }
-
+  type TPagination = { limit: number; page:number }
   type TCount = number;
   let files: TFile[] = [];
   let pagination: TPagination[] = [];
   let totalCount: TCount = 0;
 
-  // 🚀 NEW: folders from Trelae list API
+  // folders from Trelae list API
   type TFolder = { name: string; location: string };
   let folders: TFolder[] = [];
 
   // JSON out (for testing)
   let lastListJson: any = null;
 
-  // Simple chat stub (UI only)
-  let chatInput = '';
-
-  // ─────────────────────────────────────────────
   // Helpers
-  // ─────────────────────────────────────────────
   function baseFromZip(name: string) {
-    // keep spaces intact; just remove a single trailing .zip (case-insensitive)
     const m = name.match(/^(.*)\.zip$/i);
     return (m ? m[1] : name).trim();
   }
-
   function fmtSize(n?: number) {
     if (!n && n !== 0) return '';
     if (n < 1024) return `${n} B`;
@@ -96,11 +95,23 @@
     listLocation = '';
     listMsg = null;
     files = [];
-    folders = [];          // ← reset folders too
+    folders = [];
     lastListJson = null;
+
+    // LLM integration state reset
+    folderSaved = false;
+    saveMsg = null;
+    saving = false;
+    events = [];
+    connectionStatus = 'disconnected';
+
+    // collapse panels again on new selection
+    showFolders = false;
+    showFiles = false;
+    showJson = false;
   }
 
-  // XHR helpers to show progress (fetch doesn't provide upload progress)
+  // XHR helpers (upload progress)
   function xhrPut(url: string, blob: Blob, onProgress: (p: number) => void): Promise<string> {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
@@ -110,7 +121,6 @@
       };
       xhr.onload = () => {
         if (xhr.status >= 200 && xhr.status < 300) {
-          // Try to read ETag if present
           resolve(xhr.getResponseHeader('ETag') || xhr.getResponseHeader('etag') || '');
         } else {
           reject(new Error(`HTTP ${xhr.status}`));
@@ -121,23 +131,20 @@
     });
   }
 
-  // ─────────────────────────────────────────────
   // readiness check after unzip
-  // ─────────────────────────────────────────────
   function isFileUploadedReady(f: any): boolean {
     if (!f || !f.metadata) return false;
     const status =
       (f.metadata.status ||
-      f.metadata.uploadStatus ||
-      f.metadata.state ||
-      f.status ||            // in case status is top-level
-      ''
+       f.metadata.uploadStatus ||
+       f.metadata.state ||
+       f.status ||
+       ''
       ).toString().toLowerCase();
 
     return status === 'uploaded';
   }
 
-  // add settleMs to the options and a short delay after allReady
   async function waitForAllExtracted(
     loc: string,
     opts?: { timeoutMs?: number; intervalMs?: number; settleMs?: number }
@@ -157,25 +164,20 @@
       const fs: any[] = Array.isArray(data?.files) ? data.files : [];
       const ds: any[] = Array.isArray(data?.folders) ? data.folders : [];
 
-      // If there are files, ALL must be "uploaded". If there are no files, folders alone are OK.
       const haveFiles = fs.length > 0;
       const allUploaded = haveFiles ? fs.every(isFileUploadedReady) : true;
 
       if ((haveFiles || ds.length > 0) && allUploaded) {
-        if (settleMs > 0) {
-          await new Promise((res) => setTimeout(res, settleMs)); // grace delay for backend index/metadata
-        }
+        if (settleMs > 0) await new Promise((res) => setTimeout(res, settleMs));
         return;
       }
 
-      if (Date.now() - started > timeoutMs) return; // stop polling silently; manual refresh still works
+      if (Date.now() - started > timeoutMs) return;
       await new Promise((res) => setTimeout(res, intervalMs));
     }
   }
 
-  // ─────────────────────────────────────────────
   // Upload + Unzip + List
-  // ─────────────────────────────────────────────
   async function uploadAndExtract() {
     if (!file) return;
 
@@ -231,9 +233,7 @@
           body: JSON.stringify({ action: 'completeMultipart', fileId, uploadId, parts })
         });
         const cdata = await complete.json();
-        if (!complete.ok || cdata?.success !== true) {
-          throw new Error(cdata?.error || 'Failed to complete multipart upload');
-        }
+        if (!complete.ok || cdata?.success !== true) throw new Error(cdata?.error || 'Failed to complete multipart upload');
         uploadedFileId = fileId;
       } else {
         throw new Error('Unknown upload mode');
@@ -330,6 +330,9 @@
       handleFilesListed({ files, folders, pagination, totalCount });
 
       listMsg = `Found ${files.length} file${files.length === 1 ? '' : 's'} and ${folders.length} folder${folders.length === 1 ? '' : 's'}.`;
+
+      // 🔗 NEW: after a successful first list, persist to backend once
+      await maybePersistFolderStructure();
     } catch (e: any) {
       listMsg = `List error: ${e?.message ?? e}`;
     } finally {
@@ -338,7 +341,7 @@
   }
 
   function handleFilesListed(payload: any) {
-    // 👇 Your future pipeline hook. For now, log & expose to UI.
+    // future pipeline hook. For now, log & expose to UI.
     console.log('[AI Code Reviewer] files listed:', payload);
     lastListJson = payload;
   }
@@ -361,53 +364,353 @@
     }
   }
 
-  // 🔸 NEW: open a folder tile (drill in)
+  // open a folder tile (drill in)
   function openFolder(folder: TFolder) {
     const next = `${(folder.location || '').replace(/^\/+|\/+$/g, '')}/${folder.name}`.replace(/^\/+/, '');
     listLocation = next;
     refreshList();
   }
 
-  function onChatSubmit() {
-    if (!chatInput.trim()) return;
-    console.log('[AI Code Reviewer] chat prompt:', chatInput);
-    chatInput = '';
+  // 🔥 LLM BACKEND INTEGRATION (auto-save + streaming UI)
+
+  let analysisMessage = 'Scan routes and identify potential issues';
+
+  // Persist folder structure once per uploaded zip
+  let folderSaved = false;
+  let saving = false;
+  let saveMsg: string | null = null;
+
+  async function maybePersistFolderStructure() {
+    if (!uploadedFileId || !lastListJson || folderSaved) return;
+
+    try {
+      saving = true;
+      saveMsg = 'Saving project structure…';
+
+      const body = {
+        userId,
+        zipFileId: uploadedFileId,
+        folderStructure: {
+          rootLocation: listLocation,
+          ...lastListJson
+        }
+      };
+
+      const r = await fetch(`${backendUrl}/review-zip`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok && r.status !== 409) throw new Error(d?.error || 'Failed to save');
+
+      folderSaved = true;
+      saveMsg = r.status === 409 ? 'Structure already saved for this user & zip' : 'Structure saved ✓';
+    } catch (e: any) {
+      saveMsg = `Save failed: ${e?.message ?? e}`;
+    } finally {
+      saving = false;
+    }
+  }
+
+  type StreamEvent = { id: number; type: string; data: any };
+  let events: StreamEvent[] = [];
+  let eventId = 0;
+  let controller: AbortController | null = null;
+
+  type Conn = 'disconnected' | 'connecting' | 'connected';
+  let connectionStatus: Conn = 'disconnected';
+  let isThinking = false;
+
+  function statusDotClass() {
+    return connectionStatus === 'connected'
+      ? 'bg-green-500'
+      : connectionStatus === 'connecting'
+      ? 'bg-yellow-500'
+      : 'bg-red-500';
+  }
+
+  // refs for auto-scroll
+  let streamContainer: HTMLDivElement;
+  let pageEnd: HTMLDivElement;
+
+  async function scrollToLatest() {
+    // wait for DOM to update, then scroll container and page
+    await tick();
+    if (streamContainer) {
+      streamContainer.scrollTo({ top: streamContainer.scrollHeight, behavior: 'smooth' });
+    }
+    // also nudge the whole page down to keep stream in view
+    if (pageEnd) {
+      pageEnd.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    } else {
+      window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+    }
+  }
+
+  function addEvent(type: string, data: any) {
+    events = [...events, { id: eventId++, type, data }];
+    // simple "thinking" heuristic
+    const thinkingEvents = ['start','progress','directory_scan_started','file_access_started','file_analysis_started'];
+    isThinking = thinkingEvents.includes(type);
+    scrollToLatest();
+  }
+
+  function clearEvents() {
+    events = [];
+    eventId = 0;
+    isThinking = false;
+  }
+
+  function parseSSELine(line: string) {
+    if (line.startsWith('event: ')) {
+      return { type: 'event', value: line.slice(7).trim() };
+    }
+    if (line.startsWith('data: ')) {
+      return { type: 'data', value: line.slice(6).trim() };
+    }
+    if (line.startsWith(': ')) {
+      return { type: 'comment', value: line.slice(2) };
+    }
+    return null;
+  }
+
+  async function startAnalysis() {
+    if (!uploadedFileId) {
+      saveMsg = 'Upload a zip first';
+      return;
+    }
+    // ensure saved
+    if (!folderSaved) {
+      await maybePersistFolderStructure();
+      if (!folderSaved) return;
+    }
+
+    clearEvents();
+    controller?.abort();
+    controller = new AbortController();
+    connectionStatus = 'connecting';
+
+    try {
+      const res = await fetch(`${backendUrl}/ai/review/stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId, zipFileId: uploadedFileId, message: analysisMessage }),
+        signal: controller.signal
+      });
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+      if (!res.body) throw new Error('No response body');
+
+      connectionStatus = 'connected';
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let currentEvent: string | null = null;
+      let currentData: any = null;
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          const parsed = parseSSELine(line);
+          if (parsed?.type === 'event') {
+            currentEvent = parsed.value;
+          } else if (parsed?.type === 'data') {
+            try { currentData = JSON.parse(parsed.value); }
+            catch { currentData = { message: parsed.value, timestamp: Date.now() }; }
+          } else if (line === '' && currentEvent && currentData) {
+            addEvent(currentEvent, currentData);
+            currentEvent = null;
+            currentData = null;
+          }
+        }
+      }
+
+      connectionStatus = 'disconnected';
+      isThinking = false;
+    } catch (err: any) {
+      connectionStatus = 'disconnected';
+      if (err?.name !== 'AbortError') {
+        addEvent('error', { message: `Connection failed: ${err?.message ?? err}`, timestamp: Date.now() });
+      }
+    }
+  }
+
+  function stopAnalysis() {
+    controller?.abort();
+    connectionStatus = 'disconnected';
+    isThinking = false;
+  }
+
+  // Collapsibles (default collapsed)
+  let showFolders = false;
+  let showFiles = false;
+  let showJson = false;
+
+  // Stepper view
+  function stepClass(state: 'done'|'current'|'future') {
+    return state === 'done'
+      ? 'bg-green-100 text-green-800 ring-1 ring-green-200'
+      : state === 'current'
+      ? 'bg-gray-900 text-white'
+      : 'bg-gray-100 text-gray-600';
+  }
+
+  function stepState(n: number): 'done'|'current'|'future' {
+    const s1 = !!uploadedFileId || extracting || verifying || !!extractLocation;
+    const s2 = !!extractLocation && !verifying;
+    const s3 = files.length > 0;
+    const s4 = folderSaved;
+    const s5 = events.length > 0;
+    const states = [s1, s2, s3, s4, s5];
+
+    const idx = states.findIndex((ok) => !ok);
+    const current = idx === -1 ? 5 : idx + 1;
+
+    if (n < current && states[n-1]) return 'done';
+    if (n === current) return 'current';
+    return 'future';
+  }
+
+  // Markdown → safe HTML
+  function escapeHtml(s: string) {
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  function sanitizeHtml(s: string) {
+    // strip script tags + inline events
+    return s
+      .replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi,'')
+      .replace(/\son\w+="[^"]*"/gi,'')
+      .replace(/\son\w+='[^']*'/gi,'');
+  }
+
+  function mdToHtml(md: string) {
+    // Normalize CRLF -> LF and trim edges to avoid phantom blank lines
+    let out = (md ?? '').replace(/\r\n?/g, '\n').trim();
+
+    // fenced code with optional language token
+    out = out.replace(/```([a-zA-Z0-9_-]+)?\n([\s\S]*?)```/g, (_m, lang, code) => {
+      const language = lang ? ` data-language="${escapeHtml(String(lang))}"` : '';
+      const cleaned = String(code).replace(/^\n+|\n+$/g, '');
+      return `<pre class="rounded-lg border bg-gray-50 p-3 overflow-auto"${language}><code>${escapeHtml(cleaned)}</code></pre>`;
+    });
+
+    // horizontal rules (---, ***, ___) on their own line
+    out = out.replace(/^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/gm, '<hr class="my-4 border-t border-gray-200" />');
+
+    // images
+    out = out.replace(
+      /!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g,
+      '<img src="$2" alt="$1" class="rounded border max-w-full my-2" loading="lazy" referrerpolicy="no-referrer" />'
+    );
+
+    // headings
+    out = out.replace(/^\s*###### (.*)$/gm, '<h6 class="font-semibold mt-3 mb-1">$1</h6>');
+    out = out.replace(/^\s*##### (.*)$/gm, '<h5 class="font-semibold mt-3 mb-1">$1</h5>');
+    out = out.replace(/^\s*#### (.*)$/gm, '<h4 class="font-semibold mt-3 mb-1">$1</h4>');
+    out = out.replace(/^\s*### (.*)$/gm, '<h3 class="font-semibold text-base mt-3 mb-1">$1</h3>');
+    out = out.replace(/^\s*## (.*)$/gm, '<h2 class="font-semibold text-lg mt-4 mb-2">$1</h2>');
+    out = out.replace(/^\s*# (.*)$/gm, '<h1 class="font-semibold text-xl mt-4 mb-2">$1</h1>');
+
+    // lists
+    out = out.replace(/^(?:\s*[-*] .*(?:\n|$))+?/gm, (block) => {
+      const items = block
+        .trim()
+        .split('\n')
+        .map((line) => line.replace(/^\s*[-*] (.*)$/, '<li>$1</li>'))
+        .join('');
+      return `<ul class="list-disc pl-5 my-2 space-y-1">${items}</ul>`;
+    });
+
+    // links (do after images)
+    out = out.replace(
+      /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+      '<a href="$2" target="_blank" rel="noreferrer" class="underline text-blue-600">$1</a>'
+    );
+
+    // bold / italic / inline code
+    out = out.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+    out = out.replace(/(^|[^\*])\*(.*?)\*(?!\*)/g, '$1<em>$2</em>');
+    out = out.replace(/`([^`]+)`/g, '<code class="px-1 py-0.5 rounded bg-gray-100 border">$1</code>');
+
+    // paragraphs: group consecutive non-HTML lines into a single paragraph.
+    // Inside a paragraph, keep single line breaks as <br /> (no extra vertical gaps).
+    out = out.replace(/(^|\n)(?!\s*<)([^\n][\s\S]*?)(?=\n{2,}|$)/g, (_m, pfx, block) => {
+      const html = String(block).trim().replace(/\n+/g, '<br />');
+      return `${pfx}<p class="my-2">${html}</p>`;
+    });
+
+    return sanitizeHtml(out.trim());
   }
 </script>
 
-<!-- ─────────────────────────────────────────────
-     Layout
-────────────────────────────────────────────── -->
+<!-- Layout -->
 <div class="max-w-6xl mx-auto p-6 space-y-8">
-  <div class="flex items-baseline justify-between">
-    <h1 class="text-3xl font-semibold">AI Code Reviewer</h1>
-    <div class="text-xs text-gray-500">Upload → Unzip → Browse</div>
+  <!-- Title + Stepper -->
+  <div class="space-y-3">
+    <div class="flex flex-col">
+      <h1 class="text-3xl font-semibold">AI Code Reviewer</h1>
+      <div class="text-xs text-gray-500 font-light italic">Powered by Trelae Files</div>
+    </div>
+
+    <!-- Stepper -->
+    <div class="flex flex-wrap gap-2">
+      <span class="text-xs px-2.5 py-1.5 rounded-full {stepClass(stepState(1))}">Upload</span>
+      <span class="text-xs px-2.5 py-1.5 rounded-full {stepClass(stepState(2))}">Unzip & Verify</span>
+      <span class="text-xs px-2.5 py-1.5 rounded-full {stepClass(stepState(3))}">Browse</span>
+      <span class="text-xs px-2.5 py-1.5 rounded-full {stepClass(stepState(4))}">Save</span>
+      <span class="text-xs px-2.5 py-1.5 rounded-full {stepClass(stepState(5))}">Analyze</span>
+    </div>
   </div>
 
-  <!-- Upload card -->
-  <div class="border rounded-2xl p-5 space-y-4">
-    <div class="space-y-2">
-      <label for="zip-file" class="text-sm font-medium">ZIP file</label>
-      <input id="zip-file" type="file" accept=".zip" class="block w-full text-sm" on:change={onPick} />
-      <p class="text-xs text-gray-500">Only .zip is allowed. We’ll choose single vs multipart based on size.</p>
+  <!-- Upload / Extract card -->
+  <div class="border rounded-2xl p-5 space-y-4 bg-white">
+    <div class="space-y-3">
+
+      <!-- Drop zone -->
+      <label
+        for="zip-file"
+        class="flex flex-col items-center justify-center w-full p-6 border border-dashed rounded-xl cursor-pointer 
+              hover:border-gray-400 hover:bg-gray-50 transition"
+      >
+        <svg class="w-10 h-10 text-gray-400 mb-2" fill="none" stroke="currentColor" stroke-width="2"
+            viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round"
+                d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6h.1a5 5 0 010 10h-1M12 12v9m0 0l-3-3m3 3l3-3"/>
+        </svg>
+        <p class="text-sm text-gray-600"><span class="font-medium">Click to upload</span></p>
+        <p class="text-xs text-gray-400">Only zip files are supported</p>
+      </label>
+
+      <!-- Hidden input -->
+      <input id="zip-file" type="file" accept=".zip" class="hidden" on:change={onPick} />
     </div>
 
     <div class="flex flex-col gap-3">
       <button
-      class="px-4 py-2 rounded-xl bg-gray-900 text-white font-medium hover:bg-black disabled:opacity-60 w-44"
-      on:click={uploadAndExtract}
-      disabled={!file || uploading || extracting || verifying}
-    >
-      {#if uploading}
-        Uploading
-      {:else if verifying}
-        Verifying file status
-      {:else if extracting}
-        Unzipping
-      {:else}
-        Upload & Extract
-      {/if}
-    </button>
+        class="px-4 py-2 rounded-xl bg-gray-900 text-white font-medium hover:bg-black disabled:opacity-60 w-44"
+        on:click={uploadAndExtract}
+        disabled={!file || uploading || extracting || verifying}
+      >
+        {#if uploading}
+          Uploading
+        {:else if verifying}
+          Verifying file status
+        {:else if extracting}
+          Unzipping
+        {:else}
+          Upload & Extract
+        {/if}
+      </button>
 
       <!-- Progress bar -->
       {#if uploading}
@@ -420,7 +723,7 @@
       {/if}
     </div>
 
-    {#if uploadMsg}<div class="text-sm text-green-700">{uploadMsg}</div>{/if}
+    {#if uploadMsg}<div class="text-sm text-green-700 italic">{uploadMsg}</div>{/if}
     <!-- during unzip -->
     {#if extracting}
       <p class="text-sm text-gray-600 italic animate-pulse">Zip extracting…{'.'.repeat(unzipSpinnerTick)}</p>
@@ -463,94 +766,192 @@
     {/if}
   </div>
 
-  <!-- 🗂️ Folders grid -->
-  <div class="space-y-2">
-    {#if folders.length}
-      <div class="text-sm font-medium">Extracted folders</div>
-      <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-        {#each folders as d}
-          <div class="border rounded-xl p-3 flex flex-col gap-2">
-            <div class="flex items-center justify-between gap-2">
-              <div class="font-medium truncate" title={d.name}>📁 {d.name}</div>
-              <span class="text-xs px-2 py-0.5 rounded-full bg-gray-100">folder</span>
-            </div>
-            <div class="text-xs text-gray-600 break-all">
-              <span class="font-semibold">Path:</span> {(d.location || '')}/{d.name}
-            </div>
-            <div class="mt-1">
-              <button
-                class="inline-flex items-center px-3 py-1.5 rounded-lg border text-sm hover:bg-gray-50"
-                on:click={() => openFolder(d)}
-              >Open</button>
-            </div>
-          </div>
-        {/each}
-      </div>
-    {/if}
-  </div>
-
-  <!-- 📄 Files grid -->
-  <div class="space-y-2">
-    <div class="text-sm font-medium">Extracted files</div>
-
-    {#if files.length === 0}
-      <div class="text-sm text-gray-500">No files found in this extraction.</div>
-    {:else}
-      <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-        {#each files as f, i}
-          <div class="border rounded-xl p-3 flex flex-col gap-2">
-            <div class="flex items-center justify-between gap-2">
-              <div class="font-medium truncate" title={f.name}>{f.name}</div>
-              <span class="text-xs px-2 py-0.5 rounded-full bg-gray-100">{f.metadata?.fileType || 'unknown'}</span>
-            </div>
-            <div class="text-xs text-gray-600">
-              <div><span class="font-semibold">Size:</span> {fmtSize(f.metadata?.size)}</div>
-              <div class="break-all"><span class="font-semibold">Location:</span> {(f.location || listLocation)}/</div>
-            </div>
-            <div class="mt-1 flex gap-2">
-              {#if f.url}
-                <a class="inline-flex items-center px-3 py-1.5 rounded-lg border text-sm hover:bg-gray-50"
-                   href={f.url} target="_blank" rel="noreferrer">Download</a>
-              {:else}
-                <button class="inline-flex items-center px-3 py-1.5 rounded-lg border text-sm hover:bg-gray-50 disabled:opacity-60"
-                        on:click={() => getLink(i)} disabled={!!f._loading}>
-                  {#if f._loading}Getting link…{/if}{#if !f._loading}Get link{/if}
-                </button>
-              {/if}
-              {#if f._err}<span class="text-xs text-red-700">{f._err}</span>{/if}
-            </div>
-          </div>
-        {/each}
-      </div>
-    {/if}
-  </div>
-
-  <!-- Raw JSON preview (from handleFilesListed) -->
-  <div class="border rounded-2xl p-4">
-    <div class="text-sm font-medium mb-2">Listed JSON (testing)</div>
-    {#if lastListJson}
-      <pre class="text-xs bg-gray-50 p-3 rounded-lg overflow-auto max-h-80">{JSON.stringify(lastListJson, null, 2)}</pre>
-    {:else}
-      <div class="text-xs text-gray-500">Nothing listed yet.</div>
-    {/if}
-  </div>
-
-  <!-- Chat stub -->
-  <div class="border rounded-2xl p-4 space-y-2">
-    <div class="text-sm font-medium">Ask a question (wire up later)</div>
-    <textarea
-      class="w-full rounded-xl border px-3 py-2 text-sm"
-      rows="3"
-      bind:value={chatInput}
-      placeholder="e.g., Where is the main logic?"
-    ></textarea>
-    <div class="flex justify-end">
-      <button class="px-4 py-2 rounded-xl bg-gray-900 text-white font-semibold hover:bg-black disabled:opacity-60"
-              on:click={onChatSubmit} disabled={!chatInput.trim()}>
-        Submit
+  <!-- Browse section (collapsibles) -->
+  <div class="space-y-3">
+    <!-- Folders -->
+    <div class="border rounded-2xl bg-white">
+      <button class="w-full flex items-center justify-between px-4 py-3 text-sm font-medium"
+        on:click={() => showFolders = !showFolders}>
+        <span>Extracted folders</span>
+        <span class="flex items-center gap-2 text-xs text-gray-600">
+          {folders.length} total
+          <svg class="w-4 h-4 transition-transform" style={`transform: rotate(${showFolders ? 180 : 0}deg);`} viewBox="0 0 20 20"><path d="M5 8l5 5 5-5H5z" /></svg>
+        </span>
       </button>
+      {#if showFolders && folders.length}
+        <div class="px-4 pb-4">
+          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+            {#each folders as d}
+              <div class="border rounded-xl p-3 flex flex-col gap-2 bg-white">
+                <div class="flex items-center justify-between gap-2">
+                  <div class="font-medium truncate" title={d.name}>📁 {d.name}</div>
+                  <span class="text-xs px-2 py-0.5 rounded-full bg-gray-100">folder</span>
+                </div>
+                <div class="text-xs text-gray-600 break-all">
+                  <span class="font-semibold">Path:</span> {(d.location || '')}/{d.name}
+                </div>
+                <div class="mt-1">
+                  <button class="inline-flex items-center px-3 py-1.5 rounded-lg border text-sm hover:bg-gray-50" on:click={() => openFolder(d)}>Open</button>
+                </div>
+              </div>
+            {/each}
+          </div>
+        </div>
+      {:else if showFolders}
+        <div class="px-4 pb-4 text-xs text-gray-500">No folders found.</div>
+      {/if}
+    </div>
+
+    <!-- Files -->
+    <div class="border rounded-2xl bg-white">
+      <button class="w-full flex items-center justify-between px-4 py-3 text-sm font-medium"
+        on:click={() => showFiles = !showFiles}>
+        <span>Extracted files</span>
+        <span class="flex items-center gap-2 text-xs text-gray-600">
+          {files.length} total
+          <svg class="w-4 h-4 transition-transform" style={`transform: rotate(${showFiles ? 180 : 0}deg);`} viewBox="0 0 20 20"><path d="M5 8l5 5 5-5H5z" /></svg>
+        </span>
+      </button>
+
+      {#if showFiles}
+        <div class="px-4 pb-4">
+          {#if files.length === 0}
+            <div class="text-sm text-gray-500">No files found in this extraction.</div>
+          {:else}
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+              {#each files as f, i}
+                <div class="border rounded-xl p-3 flex flex-col gap-2 bg-white">
+                  <div class="flex items-center justify-between gap-2">
+                    <div class="font-medium truncate" title={f.name}>{f.name}</div>
+                    <span class="text-xs px-2 py-0.5 rounded-full bg-gray-100">{f.metadata?.fileType || 'unknown'}</span>
+                  </div>
+                  <div class="text-xs text-gray-600">
+                    <div><span class="font-semibold">Size:</span> {fmtSize(f.metadata?.size)}</div>
+                    <div class="break-all"><span class="font-semibold">Location:</span> {(f.location || listLocation)}/</div>
+                  </div>
+                  <div class="mt-1 flex gap-2">
+                    {#if f.url}
+                      <a class="inline-flex items-center px-3 py-1.5 rounded-lg border text-sm hover:bg-gray-50" href={f.url} target="_blank" rel="noreferrer">Download</a>
+                    {:else}
+                      <button class="inline-flex items-center px-3 py-1.5 rounded-lg border text-sm hover:bg-gray-50 disabled:opacity-60"
+                        on:click={() => getLink(i)} disabled={!!f._loading}>
+                        {#if f._loading}Getting link…{/if}{#if !f._loading}Get link{/if}
+                      </button>
+                    {/if}
+                    {#if f._err}<span class="text-xs text-red-700">{f._err}</span>{/if}
+                  </div>
+                </div>
+              {/each}
+            </div>
+          {/if}
+        </div>
+      {/if}
+    </div>
+
+    <!-- JSON debug -->
+    <!-- <div class="border rounded-2xl bg-white">
+      <button class="w-full flex items-center justify-between px-4 py-3 text-sm font-medium"
+        on:click={() => showJson = !showJson}>
+        <span>Listed JSON (testing)</span>
+        <span class="flex items-center gap-2 text-xs text-gray-600">
+          {lastListJson ? 'Available' : 'Empty'}
+          <svg class="w-4 h-4 transition-transform" style={`transform: rotate(${showJson ? 180 : 0}deg);`} viewBox="0 0 20 20"><path d="M5 8l5 5 5-5H5z" /></svg>
+        </span>
+      </button>
+      {#if showJson}
+        <div class="p-4">
+          {#if lastListJson}
+            <pre class="text-xs bg-gray-50 p-3 rounded-lg overflow-auto max-h-80 border">{JSON.stringify(lastListJson, null, 2)}</pre>
+          {:else}
+            <div class="text-xs text-gray-500">Nothing listed yet.</div>
+          {/if}
+        </div>
+      {/if}
+    </div> -->
+  </div>
+
+  <!-- AI Review (stream) -->
+  <div class="border rounded-2xl p-5 space-y-4 bg-white">
+    <div class="flex items-center justify-between">
+      <h2 class="text-lg font-semibold">AI Review</h2>
+      <div class="flex items-center gap-2 text-xs">
+        <span class="w-2.5 h-2.5 rounded-full {statusDotClass()}"></span>
+        <span class="capitalize">{connectionStatus}</span>
+      </div>
+    </div>
+
+    <div>
+      <label for="request-message" class="text-xs text-gray-600">Request Message</label>
+      <textarea id="request-message" rows="2" class="w-full rounded-xl border px-3 py-2 text-sm" bind:value={analysisMessage}
+        placeholder="What should the reviewer look for?"></textarea>
+    </div>
+
+    <div class="flex flex-wrap items-center gap-2">
+      <button class="px-3 py-2 rounded-xl border text-sm hover:bg-gray-50 disabled:opacity-60"
+        on:click={maybePersistFolderStructure} disabled={saving || !lastListJson || !uploadedFileId}>
+        {saving ? 'Saving…' : (folderSaved ? 'Saved ✓' : 'Save structure')}
+      </button>
+
+      <button class="px-4 py-2 rounded-xl bg-gray-900 text-white text-sm font-medium hover:bg-black disabled:opacity-60"
+        on:click={startAnalysis}
+        disabled={!folderSaved || connectionStatus === 'connected'}>
+        Start Analysis
+      </button>
+
+      <button class="px-3 py-2 rounded-xl border text-sm hover:bg-gray-50 disabled:opacity-60"
+        on:click={stopAnalysis} disabled={connectionStatus !== 'connected'}>
+        Stop
+      </button>
+
+      <button class="px-3 py-2 rounded-xl border text-sm hover:bg-gray-50"
+        on:click={clearEvents}>
+        Clear
+      </button>
+
+      {#if saveMsg}<div class="text-sm text-gray-600">{saveMsg}</div>{/if}
+    </div>
+
+    <!-- Stream panel -->
+    <div class="border rounded-xl overflow-hidden">
+      <div class="px-4 py-2 border-b bg-gray-50 text-sm font-medium">Analysis Stream</div>
+      <div class="max-h-[60vh] overflow-y-auto divide-y" bind:this={streamContainer}>
+        {#if events.length === 0}
+          <div class="py-16 text-center text-sm text-gray-500">
+            Click <span class="font-medium">Start Analysis</span> to begin streaming AI code review
+          </div>
+        {:else}
+          {#each events as e (e.id)}
+            <div class="p-4 space-y-2">
+              <div class="flex items-center gap-2">
+                <span class="text-[11px] font-mono px-2 py-0.5 rounded-full bg-gray-100">{e.type}</span>
+                <span class="text-xs text-gray-500">{new Date(e.data?.timestamp || Date.now()).toLocaleTimeString()}</span>
+              </div>
+
+              {#if e.type === 'analysis_result'}
+                <div class="text-sm">Analysis completed successfully</div>
+                {#if e.data?.message}
+                  <div class="markdown-body text-[13px] leading-6">
+                    {@html mdToHtml(e.data.message)}
+                  </div>
+                {/if}
+              {:else}
+                <div class="text-sm">{e.data?.message || e.data?.status || 'Event received'}</div>
+              {/if}
+            </div>
+          {/each}
+        {/if}
+      </div>
+      {#if isThinking}
+        <div class="px-4 py-2 text-xs text-gray-600 italic border-t flex items-center gap-2">
+          <span class="w-3 h-3 border-2 border-gray-200 border-t-gray-600 rounded-full animate-spin"></span>
+          Processing…
+        </div>
+      {/if}
     </div>
   </div>
+
+  <!-- sentinel for page-level auto-scroll -->
+  <div bind:this={pageEnd}></div>
 </div>
 
 <style>

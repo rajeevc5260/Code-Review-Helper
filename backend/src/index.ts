@@ -484,11 +484,11 @@ app.post("/ai/review/stream", async (req, res) => {
                     toolLogs.push({ name, args, result, duration: ms });
                     send("file_analysis_complete", {
                         fileName: out?.name || "unknown",
-                        fileSizeBytes: out?.bytes || 0,
-                        contentTruncated: !!out?.truncated,
+                        fileSizeBytes: typeof (out as any)?.bytes === "number" ? (out as any).bytes : 0,
+                        contentTruncated: 'truncated' in out ? !!(out as any).truncated : false,
                         durationMs: ms,
                         timestamp: Date.now(),
-                        message: `File analysis completed for ${out?.name || "file"} (${out?.bytes || 0} bytes) in ${ms}ms`
+                        message: `File analysis completed for ${out?.name || "file"} (${('bytes' in out && typeof out.bytes === 'number') ? out.bytes : 0} bytes) in ${ms}ms`
                     });
                 } else {
                     result = { error: `unknown_tool: ${name}` };
