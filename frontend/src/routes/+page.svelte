@@ -11,7 +11,11 @@
   let extracting = false;
   let extractMsg: string | null = null;
   let extractLocation: string | null = null;
-  let unzipSpinnerTick = 0;        // for subtle animated dots
+  let unzipSpinnerTick = 0;
+
+  // verification phase after unzip
+  let verifying = false;
+  let verifySpinnerTick = 0;
 
   // NEW: zip base name (folder inside extracted location)
   let zipBase = '';
@@ -33,7 +37,16 @@
     _loading?: boolean;
     _err?: string;
   };
+
+  type TPagination = {
+    limit: number;
+    page:number
+  }
+
+  type TCount = number;
   let files: TFile[] = [];
+  let pagination: TPagination[] = [];
+  let totalCount: TCount = 0;
 
   // 🚀 NEW: folders from Trelae list API
   type TFolder = { name: string; location: string };
@@ -109,16 +122,19 @@
   }
 
   // ─────────────────────────────────────────────
-  // NEW: readiness check after unzip
+  // readiness check after unzip
   // ─────────────────────────────────────────────
   function isFileUploadedReady(f: any): boolean {
-    const m = f?.metadata ?? {};
-    const status = (m.status || '').toString();
-    if (/uploaded|ready|complete/i.test(status)) return true;
-    if (m.ready === true || m.uploadCompleted === true) return true;
-    if (Number.isFinite(m.size) && m.size >= 0) return true; // Trelae commonly sets size in metadata
-    if (m.etag || m.hash || m.sha256) return true;
-    return false;
+    if (!f || !f.metadata) return false;
+    const status =
+      (f.metadata.status ||
+      f.metadata.uploadStatus ||
+      f.metadata.state ||
+      f.status ||            // in case status is top-level
+      ''
+      ).toString().toLowerCase();
+
+    return status === 'uploaded';
   }
 
   // add settleMs to the options and a short delay after allReady
@@ -128,33 +144,31 @@
   ) {
     const timeoutMs = opts?.timeoutMs ?? 90_000;
     const intervalMs = opts?.intervalMs ?? 1_200;
-    const settleMs = opts?.settleMs ?? 1_500; // NEW: post-ready grace delay
+    const settleMs = opts?.settleMs ?? 1_500;
     const started = Date.now();
 
     while (true) {
       const r = await fetch('/ziplab', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'list',
-          location: loc,
-          limit: 100,
-          page: 1
-        })
+        body: JSON.stringify({ action: 'list', location: loc, limit: 100, page: 1 })
       });
       const data = await r.json().catch(() => ({}));
       const fs: any[] = Array.isArray(data?.files) ? data.files : [];
       const ds: any[] = Array.isArray(data?.folders) ? data.folders : [];
 
-      const allReady = fs.every(isFileUploadedReady);
-      if ((fs.length > 0 || ds.length > 0) && allReady) {
+      // If there are files, ALL must be "uploaded". If there are no files, folders alone are OK.
+      const haveFiles = fs.length > 0;
+      const allUploaded = haveFiles ? fs.every(isFileUploadedReady) : true;
+
+      if ((haveFiles || ds.length > 0) && allUploaded) {
         if (settleMs > 0) {
-          await new Promise((res) => setTimeout(res, settleMs)); // ✅ let backend finish updating
+          await new Promise((res) => setTimeout(res, settleMs)); // grace delay for backend index/metadata
         }
         return;
       }
 
-      if (Date.now() - started > timeoutMs) return; // give up silently
+      if (Date.now() - started > timeoutMs) return; // stop polling silently; manual refresh still works
       await new Promise((res) => setTimeout(res, intervalMs));
     }
   }
@@ -239,7 +253,9 @@
     // unzip
     extracting = true;
     unzipSpinnerTick = 0;
-    const spinnerTimer = setInterval(() => (unzipSpinnerTick = (unzipSpinnerTick + 1) % 4), 400);
+    const unzipTimer = setInterval(() => (unzipSpinnerTick = (unzipSpinnerTick + 1) % 4), 400);
+
+    let verifyTimer: any = null;
 
     try {
       const res = await fetch('/ziplab', {
@@ -250,6 +266,10 @@
       const data = await res.json();
       if (!res.ok) throw new Error(data?.message || data?.error || 'Unzip failed');
 
+      // Unzip finished
+      clearInterval(unzipTimer);
+      extracting = false;
+
       extractLocation = data.location;
       extractMsg = `Extracted to ${extractLocation}/`;
 
@@ -257,15 +277,24 @@
       // e.g. CodeZips/abc123/<zipBase>
       listLocation = `${extractLocation}/${zipBase}`;
 
-      // ⏳ Wait until extracted files are ready, then add a little grace delay
+      // ✅ Verification phase (button text changes; listing only after this)
+      verifying = true;
+      verifySpinnerTick = 0;
+      verifyTimer = setInterval(() => (verifySpinnerTick = (verifySpinnerTick + 1) % 4), 400);
+
       await waitForAllExtracted(listLocation, { settleMs: 2000 });
 
-      // Now render the final listing
+      verifying = false;
+      if (verifyTimer) clearInterval(verifyTimer);
+
+      // Final list AFTER verification
       await refreshList(false);
     } catch (e: any) {
       extractMsg = `Extraction failed: ${e?.message ?? e}`;
+      if (verifyTimer) clearInterval(verifyTimer);
     } finally {
-      clearInterval(spinnerTimer);
+      clearInterval(unzipTimer);
+      verifying = false;
       extracting = false;
     }
   }
@@ -294,9 +323,11 @@
         return;
       }
       files = (data.files || []) as TFile[];
-      folders = (data.folders || []) as TFolder[];    // ← capture folders
+      folders = (data.folders || []) as TFolder[];
+      pagination = (data.pagination || []) as TPagination[];
+      totalCount = data.totalCount || 0;
 
-      handleFilesListed({ files, folders });
+      handleFilesListed({ files, folders, pagination, totalCount });
 
       listMsg = `Found ${files.length} file${files.length === 1 ? '' : 's'} and ${folders.length} folder${folders.length === 1 ? '' : 's'}.`;
     } catch (e: any) {
@@ -363,14 +394,20 @@
 
     <div class="flex flex-col gap-3">
       <button
-        class="px-4 py-2 rounded-xl bg-gray-900 text-white font-medium hover:bg-black disabled:opacity-60 w-40"
-        on:click={uploadAndExtract}
-        disabled={!file || uploading || extracting}
-      >
-        {#if uploading}Uploading…{/if}
-        {#if !uploading && extracting}Unzipping{/if}
-        {#if !uploading && !extracting}Upload & Extract{/if}
-      </button>
+      class="px-4 py-2 rounded-xl bg-gray-900 text-white font-medium hover:bg-black disabled:opacity-60 w-44"
+      on:click={uploadAndExtract}
+      disabled={!file || uploading || extracting || verifying}
+    >
+      {#if uploading}
+        Uploading
+      {:else if verifying}
+        Verifying file status
+      {:else if extracting}
+        Unzipping
+      {:else}
+        Upload & Extract
+      {/if}
+    </button>
 
       <!-- Progress bar -->
       {#if uploading}
@@ -398,9 +435,14 @@
         {/if}
       </div>
     {/if}
+    {#if verifying}
+      <p class="text-sm text-gray-600 italic animate-pulse">
+        Verifying file status…{'.'.repeat(verifySpinnerTick)}
+      </p>
+    {/if}
 
     <!-- Manual list controls (pre-filled to extracted folder + zipBase) -->
-    {#if extractLocation}
+    {#if extractLocation && !verifying}
       <div class="flex flex-wrap gap-2 items-center pt-2">
         <input
           class="flex-1 min-w-[280px] rounded-xl border px-3 py-2 text-sm"

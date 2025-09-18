@@ -46,6 +46,8 @@ type TrelaeApi = {
     }) => Promise<{
       files: Array<{ id: string; name: string; size?: number; location?: string; mimeType?: string }>;
       folders: Array<{ name: string; location: string }>;
+      pagination: Array<{ limit: number; page: number}>;
+      totalCount: number
     }>;
   };
 };
@@ -176,7 +178,7 @@ export const POST: RequestHandler = async ({ request }) => {
       limit: safeLimit,
       page: safePage
     });
-    return json({ success: true, files: res.files || [], folders: res.folders || [] });
+    return json({ success: true, files: res.files || [], folders: res.folders || [], pagination: res.pagination, totalCount: res.totalCount });
   }
 
   return json({ error: 'Unsupported request' }, { status: 400 });

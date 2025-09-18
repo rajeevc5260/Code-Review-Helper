@@ -18,8 +18,8 @@ importers:
         specifier: ^4.1.13
         version: 4.1.13
       trelae-files:
-        specifier: ^0.1.7
-        version: 0.1.7
+        specifier: ^0.1.8
+        version: 0.1.8
     devDependencies:
       '@sveltejs/adapter-auto':
         specifier: ^6.0.0
@@ -806,8 +806,8 @@ packages:
   tr46@0.0.3:
     resolution: {integrity: sha512-N3WMsuqV66lT30CrXNbEjx4GEwlow3v6rr4mCcv6prnfwhS01rkgyFdjPNBYd9br7LpXV1+Emh01fHnq2Gdgrw==}
 
-  trelae-files@0.1.7:
-    resolution: {integrity: sha512-QiJlR8bnThsu/IvEunHWkyvSC0BhiIhAuyCU+UZhKSo///mOoj8WSVJHVY51EDKGPxpIVWF0NUBjhzr+qRevzQ==}
+  trelae-files@0.1.8:
+    resolution: {integrity: sha512-1X4d4I1Kh9Cu/t8BtK64v6rnTltegImjZr8nDIASkIzjXzoh13p/B9ko4RQUwrtSS1t3TuaC62PBwKauQdfmPw==}
 
   typescript@5.9.2:
     resolution: {integrity: sha512-CWBzXQrc/qOkhidw1OzBTQuYRbfyxDXJMVJ1XNwUHGROVmuaeiEm3OslpZ1RV96d7SKKjZKrSJu3+t/xlw3R9A==}
@@ -1543,7 +1543,7 @@ snapshots:
 
   tr46@0.0.3: {}
 
-  trelae-files@0.1.7: {}
+  trelae-files@0.1.8: {}
 
   typescript@5.9.2: {}
 
