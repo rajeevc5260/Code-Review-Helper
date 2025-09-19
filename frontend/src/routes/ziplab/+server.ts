@@ -1,11 +1,8 @@
 import { json, type RequestHandler } from '@sveltejs/kit';
 import { trelae } from '$lib/utils/trelae';
 import { env } from '$env/dynamic/private';
-// import { GoogleGenAI } from '@google/genai';
 
-// const GOOGLE_API_KEY = env.GOOGLE_API_KEY || '';
 const EXT_NAMESPACE_ID = env.EXT_NAMESPACE_ID || '';
-// const ai = new GoogleGenAI({ apiKey: GOOGLE_API_KEY });
 
 type TrelaeApi = {
   unzipSync: (args: {

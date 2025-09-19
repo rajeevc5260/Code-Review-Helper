@@ -3,34 +3,26 @@ import type { PageServerLoad } from './$types';
 import { randomUUID } from 'crypto';
 import { env } from '$env/dynamic/private';
 
-const ONE_YEAR = 60 * 60 * 24 * 365;
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-
-function ensureUuid(v: string | undefined | null): string {
-  if (v && UUID_RE.test(v.trim())) return v.trim().toLowerCase();
-  return randomUUID(); // canonical v4
-}
-
-export const load: PageServerLoad = async ({ cookies }) => {
+export const load: PageServerLoad = async ({ cookies, fetch }) => {
   let cookieId = cookies.get('public_user_id');
-  const validId = ensureUuid(cookieId);
-
-  // (Re)write if missing/invalid (keeps value canonical)
-  if (cookieId !== validId) {
-    cookies.set('public_user_id', validId, {
-      path: '/',
-      maxAge: ONE_YEAR,
-      httpOnly: true,
-      sameSite: 'lax',
-      secure: (env.NODE_ENV || '').toLowerCase() === 'production'
-    });
+  if (!cookieId) {
+    cookieId = randomUUID();
+    cookies.set('public_user_id', cookieId, { path: '/', maxAge: 60 * 60 * 24 * 365 }); // 1 year
   }
 
-  // backend URL from env (fallback to localhost)
   const backendUrl = env.BACKEND_URL || 'http://localhost:3010';
 
+  // fetch prior conversations for this user (optional to consume in UI)
+  let conversations: any[] = [];
+  try {
+    const r = await fetch(`${backendUrl}/chat/conversations?userId=${encodeURIComponent(cookieId)}`);
+    const d = await r.json();
+    if (r.ok && Array.isArray(d?.conversations)) conversations = d.conversations;
+  } catch { /* non-fatal */ }
+
   return {
-    userId: validId,
-    backendUrl
+    userId: cookieId,
+    backendUrl,
+    conversations // available to your +page.svelte / ChatPanel if you want to surface history
   };
 };
