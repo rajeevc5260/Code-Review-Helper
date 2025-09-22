@@ -185,6 +185,88 @@ async function readFileTextTool(args: any, tempRoot: string) {
     }
 }
 
+//  Update file tool (AI-powered)
+async function updateFileTool(args: any, tempRoot: string, ai: GoogleGenAI) {
+    const { fileId, name, location, instructions, model } = args ?? {};
+    if (!fileId) throw new Error("updateFile: fileId is required");
+    if (!name) throw new Error("updateFile: name is required");
+    if (!location) throw new Error("updateFile: location is required");
+    if (!instructions || typeof instructions !== "string" || !instructions.trim()) {
+        throw new Error("updateFile: 'instructions' must be a non-empty string");
+    }
+
+    // 1) Read current file content (full, up to ~2MB default cap for safety)
+    const current = await readFileTextTool({ fileId, name, maxBytes: 2 * 1024 * 1024 }, tempRoot);
+    if (!current || !("text" in current)) {
+        throw new Error("updateFile: could not read current file text");
+    }
+
+    // 2) Ask Gemini to produce the FULL, UPDATED file content — nothing else.
+    const rewriteSys = [
+        "You are a code rewriting engine.",
+        "Task: Apply the user's instructions to the given ORIGINAL FILE and return the COMPLETE UPDATED FILE.",
+        "Output Rules:",
+        "- Return ONLY the final file content, with no commentary, no explanations, no code fences.",
+        "- Preserve file format, imports, exports, and surrounding code unless changes are needed to satisfy the instructions.",
+        "- Keep indentation style consistent with the original.",
+        "- If you must remove code, remove it cleanly.",
+        "- If the instructions are unclear, make the minimal reasonable change.",
+    ].join("\n");
+
+    const rewritePrompt = [
+        `FILE NAME: ${name}`,
+        `LOCATION: ${location}`,
+        "",
+        "INSTRUCTIONS:",
+        instructions,
+        "",
+        "ORIGINAL FILE (verbatim):",
+        current.text,
+    ].join("\n");
+
+    const modelToUse = model || process.env.GEMINI_MODEL || "gemini-2.0-flash-001";
+    const resp = await ai.models.generateContent({
+        model: modelToUse,
+        contents: [
+            { role: "user", parts: [{ text: rewriteSys }] },
+            { role: "user", parts: [{ text: rewritePrompt }] },
+        ],
+        config: { temperature: 0.1, maxOutputTokens: 8192 },
+    });
+
+    let updated = (resp.text ?? "").trim();
+    // Remove ``` fences if the model returned them
+    if (updated.startsWith("```")) {
+        updated = updated.replace(/^```[a-zA-Z0-9_-]*\n/, "").replace(/\n```\s*$/, "").trim();
+    }
+    if (!updated) throw new Error("updateFile: empty updated content from model");
+
+    const file = trelae.file(fileId);
+    console.log("location", "name", location, name)
+    console.log("FileID", fileId)
+    await file.delete();
+
+    const { id, uploadUrl } = await namespace.getUploadUrl?.({
+        name,
+        location,
+        expiry: "1h",
+    }) || {} as any;
+
+    if (!uploadUrl) throw new Error("updateFile: failed to get upload URL");
+
+    const putRes = await fetch(uploadUrl, {
+        method: "PUT",
+        headers: { "Content-Type": "text/plain; charset=utf-8" },
+        body: Buffer.from(updated, "utf8"),
+    });
+    if (!putRes.ok) {
+        const msg = await putRes.text().catch(() => "");
+        throw new Error(`updateFile: upload failed ${putRes.status} ${putRes.statusText} ${msg}`);
+    }
+
+    return { updated: true, fileId, name, location, bytes: Buffer.byteLength(updated, "utf8"), newId: id ?? null };
+}
+
 // ======== Function Declarations for Gemini ========
 const fnListFiles: FunctionDeclaration = {
     name: "listFiles",
@@ -224,6 +306,23 @@ const fnReadFileText: FunctionDeclaration = {
             maxBytes: { type: "number", description: "Max bytes to read (default ~512KB)" },
         },
         required: ["fileId", "name"],
+    },
+};
+
+// ============ NEW: Update file function declaration ============
+const fnUpdateFile: FunctionDeclaration = {
+    name: "updateFile",
+    description: "Read a code file, apply user's fix instructions using a secondary LLM call, and upload the fully rewritten file back to the SAME name & location.",
+    parametersJsonSchema: {
+        type: "object",
+        properties: {
+            fileId: { type: "string", description: "ID of the file to update (obtained from listFiles)" },
+            name: { type: "string", description: "File name with extension (must match existing)" },
+            location: { type: "string", description: "Folder path where the file currently lives (must start with root)" },
+            instructions: { type: "string", description: "Exact change request. e.g., 'Fix the import path error and export default the handler'." },
+            model: { type: "string", description: "(Optional) Override model name" }
+        },
+        required: ["fileId", "name", "location", "instructions"],
     },
 };
 
@@ -444,13 +543,27 @@ app.post("/ai/review/stream", async (req, res) => {
             { role: "user", parts: [{ text: `ZipFileId: ${zipFileId}\n\nMessage:\n${message}` }] },
         ];
 
+        // ============ NEW: Nudge the model about the editing capability ============
+        history.push({
+            role: "user", parts: [{
+                text: [
+                    "EDITING FEATURE:",
+                    "If I ask to change/fix/update a code file, you MUST:",
+                    "1) Locate the file via listFiles,",
+                    "2) Read it using readFileText,",
+                    "3) Call updateFile({ fileId, name, location, instructions }) with a clear, concise instruction string.",
+                    "Return to analysis after the update if needed.",
+                ].join('\n')
+            }]
+        });
+
         sendProgress("Starting AI analysis of your codebase", { rootLocation });
 
         let response = await ai.models.generateContent({
             model: MODEL,
             contents: history,
             config: {
-                tools: [{ functionDeclarations: [fnListFiles, fnGetDownloadUrl, fnReadFileText] }],
+                tools: [{ functionDeclarations: [fnListFiles, fnGetDownloadUrl, fnReadFileText, fnUpdateFile] }],
                 toolConfig: { functionCallingConfig: { mode: FunctionCallingConfigMode.AUTO } },
                 temperature: 0.2,
                 maxOutputTokens: 2048
@@ -469,7 +582,7 @@ app.post("/ai/review/stream", async (req, res) => {
                 model: MODEL,
                 contents: history,
                 config: {
-                    tools: [{ functionDeclarations: [fnListFiles, fnGetDownloadUrl, fnReadFileText] }],
+                    tools: [{ functionDeclarations: [fnListFiles, fnGetDownloadUrl, fnReadFileText, fnUpdateFile] }],
                     toolConfig: { functionCallingConfig: { mode: FunctionCallingConfigMode.AUTO } },
                     temperature: 0.2,
                     maxOutputTokens: 2048
@@ -536,7 +649,13 @@ app.post("/ai/review/stream", async (req, res) => {
                         // result = await findInTreeTool(args);
                         const ms = Date.now() - t0;
                         toolLogs.push({ name, args, result, duration: ms });
-                        send("review_summary", { timestamp: Date.now(), message: `Recursive search scanned ${result.scannedFolders} folders, found ${result.matches.length} matches`, summary: summarizeToolResult(result) });
+                        send("review_summary", { timestamp: Date.now(), message: `Recursive search scanned ${result?.scannedFolders ?? 0} folders, found ${result?.matches?.length ?? 0} matches`, summary: summarizeToolResult(result) });
+                    } else if (name === "updateFile") { // NEW
+                        send("file_update_started", { timestamp: Date.now(), message: "Applying requested code changes and uploading updated file", parameters: args });
+                        result = await updateFileTool(args, tempRoot, ai);
+                        const ms = Date.now() - t0;
+                        toolLogs.push({ name, args, result, duration: ms });
+                        send("file_update_complete", { durationMs: ms, timestamp: Date.now(), message: `File updated and uploaded in ${ms}ms`, summary: summarizeToolResult(result) });
                     } else {
                         result = { error: `unknown_tool: ${name}` };
                         send("operation_error", { timestamp: Date.now(), message: `Unknown operation requested: ${name}`, operation: name });
@@ -549,7 +668,8 @@ app.post("/ai/review/stream", async (req, res) => {
                             name === "getDownloadUrl" ? "file_access" :
                                 name === "readFileText" ? "file_analysis" :
                                     name === "findInTree" ? "search" :
-                                        "operation";
+                                        name === "updateFile" ? "file_update" :
+                                            "operation";
                     sendError(`${operationType} failed after ${ms}ms`, { operation: name, operationType, durationMs: ms, error: err?.message || String(err) });
                     result = { error: err?.message || String(err) };
                 }
@@ -565,7 +685,7 @@ app.post("/ai/review/stream", async (req, res) => {
                 model: MODEL,
                 contents: history,
                 config: {
-                    tools: [{ functionDeclarations: [fnListFiles, fnGetDownloadUrl, fnReadFileText] }],
+                    tools: [{ functionDeclarations: [fnListFiles, fnGetDownloadUrl, fnReadFileText, fnUpdateFile] }],
                     toolConfig: { functionCallingConfig: { mode: FunctionCallingConfigMode.AUTO } },
                     temperature: 0.2,
                     maxOutputTokens: 2048
@@ -662,8 +782,10 @@ function summarizeToolResult(result: any) {
     }
     if (result.downloadUrl) return { downloadUrlLength: result.downloadUrl.length };
     if (result.text && result.name) return { name: result.name, bytes: result.bytes, truncated: !!result.truncated };
+    if (result.updated) return { updated: true, bytes: result.bytes };
     return Object.keys(result).slice(0, 5);
 }
+
 
 // persist structure once per upload
 const Body = z.object({
@@ -773,6 +895,52 @@ app.get("/chat/:conversationId/messages", async (req, res) => {
     }
 });
 
+
+// /review/root-folder-id?userId=...&zipFileId=...
+app.get("/review/root-folder-id", async (req, res) => {
+    try {
+        const { userId, zipFileId } = req.query;
+        if (!userId || !zipFileId) {
+            return res.status(400).json({ error: "Missing userId or zipFileId" });
+        }
+
+        // Step 1: Fetch folderStructure
+        const result = await db
+            .select({ folderStructure: reviewZip.folderStructure })
+            .from(reviewZip)
+            .where(
+                and(eq(reviewZip.userId, String(userId)), eq(reviewZip.zipFileId, String(zipFileId)))
+            )
+            .limit(1);
+
+        if (!result.length) {
+            return res.status(404).json({ error: "No record found for given userId/zipFileId" });
+        }
+
+        const folderStructure = result[0].folderStructure as any;
+        const rootLocation = folderStructure?.rootLocation;
+        if (!rootLocation) {
+            return res.status(400).json({ error: "rootLocation not found in folderStructure" });
+        }
+
+        const parts = rootLocation.split("/");
+        const cleanedRoot = parts.slice(0, 2).join("/"); // "CodeZips/2edde186"
+
+        console.log("cleanedRoot", cleanedRoot)
+
+        const filesResp: any = await namespace.getFiles?.({ location: cleanedRoot, limit: 10, page: 1 });
+        const rootFolder = filesResp?.folders?.[0];
+        return res.json({
+            rootFolderId: rootFolder?.id ?? null,
+            rootFolderName: rootFolder?.name ?? null
+        });
+
+    } catch (err: any) {
+        console.error("GET /review/root-folder-id failed:", err);
+        res.status(500).json({ error: "Internal server error", details: err.message });
+    }
+});
+  
 app.listen(PORT, () => {
     console.log(`Server running at http://localhost:${PORT}`);
 });
