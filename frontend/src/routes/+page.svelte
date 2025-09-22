@@ -590,6 +590,7 @@
     {uploadedFileId}
     {folderSaved}
     {initialConversations}
+    chatTitle={zipBase}
   />
 </div>
 

@@ -7,12 +7,14 @@
   export let folderSaved: boolean;
   export let initialConversations: any[] | undefined;
 
+  /* title to use when starting a chat (we pass the zip base from parent) */
+  export let chatTitle: string | undefined;
+
   type Msg = { kind: 'msg'; role: 'user' | 'assistant'; content: string; createdAt?: string };
   type StreamEvent = { id: number; type: string; time: number; data: any };
   type Activity = { kind: 'activity'; id: number; events: StreamEvent[]; active: boolean };
   type Row = Msg | Activity;
 
-  /* conversation list types/state */
   type Conversation = {
     id: string;
     title?: string;
@@ -40,11 +42,9 @@
   const THINKING_START = new Set(['start','progress','directory_scan_started','file_access_started','file_analysis_started']);
   const THINKING_STOP  = new Set(['directory_scan_complete','file_access_complete','file_analysis_complete','finished','error','operation_error']);
 
-  // derived flags for UI/permissions
-  $: canChat = !!conversationId && !!uploadedFileId && !!folderSaved;   // only true when structure exists
-  $: isDisconnected = !!uploadedFileId && !folderSaved;                 // show disconnected banner
+  $: canChat = !!conversationId && !!uploadedFileId && !!folderSaved;
+  $: isDisconnected = !!uploadedFileId && !folderSaved;
 
-  // ---- persist conversation per (userId + uploadedFileId)
   const CONV_KEY = (u: string, fid: string) => `acr:conv:${u}:${fid}`;
   function persistConversation() {
     if (conversationId && uploadedFileId) {
@@ -64,10 +64,9 @@
 
   onMount(() => {
     hydrateConversation();
-    if (!conversations.length) loadConversationList(); // lazy-load if server returned none
+    if (!conversations.length) loadConversationList();
   });
 
-  /* fetch list of conversations (optionally filtered by current zip) */
   async function loadConversationList() {
     try {
       const url = `${backendUrl}/chat/conversations?userId=${encodeURIComponent(userId)}${uploadedFileId ? `&zipFileId=${encodeURIComponent(uploadedFileId)}` : ''}`;
@@ -79,10 +78,9 @@
           selectedConversationId = conversations[0].id;
         }
       }
-    } catch { /* non-fatal */ }
+    } catch {}
   }
 
-  /* refresh when a new zip becomes available (not gated by folderSaved) */
   let lastZipForList: string | null = null;
   $: if (uploadedFileId && uploadedFileId !== lastZipForList) {
     lastZipForList = uploadedFileId;
@@ -91,12 +89,13 @@
 
   async function openSelectedConversation() {
     if (!selectedConversationId) return;
-    conversationId = selectedConversationId; // can open even if structure missing (read-only)
+    conversationId = selectedConversationId;
     timeline = [];
     persistConversation();
     await loadMessages();
   }
 
+  /* ---------- tiny helpers ---------- */
   function escapeHtml(s: string) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
   function sanitizeHtml(s: string) {
     return s.replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi,'').replace(/\son\w+="[^"]*"/gi,'').replace(/\son\w+='[^']*'/gi,'');
@@ -200,15 +199,24 @@
     if (!folderSaved || !uploadedFileId) return;
     const r = await fetch(`${backendUrl}/chat/start`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ userId, zipFileId: uploadedFileId })
+      /* ✅ send the file name (zip base) as the title */
+      body: JSON.stringify({ userId, zipFileId: uploadedFileId, title: (chatTitle || '').trim() || undefined })
     });
     const d = await r.json();
     if (!r.ok) throw new Error(d?.error || 'Failed to start chat');
     conversationId = d.conversationId;
     persistConversation();
-    // add to list so it appears immediately
+
+    /* add to list immediately with the chosen title */
     conversations = [
-      { id: conversationId ?? '', title: 'New chat', zip_file_id: uploadedFileId, created_at: new Date().toISOString(), message_count: 0, last_message_at: null },
+      {
+        id: conversationId ?? '',
+        title: (chatTitle || '').trim() || 'New chat',
+        zip_file_id: uploadedFileId,
+        created_at: new Date().toISOString(),
+        message_count: 0,
+        last_message_at: null
+      },
       ...conversations
     ];
     selectedConversationId = conversationId;
@@ -251,9 +259,7 @@
   }
 
   async function sendMessage() {
-    // hard block when structure is missing
     if (!folderSaved) return;
-
     if (!conversationId || !uploadedFileId || !input.trim() || connecting) return;
 
     const userText = input.trim();
@@ -302,7 +308,7 @@
               endActivityRow();
               const md = assistantDraft || (curData?.message ?? 'Analysis completed.');
               timeline = [...timeline, { kind:'msg', role:'assistant', content: md }];
-              await loadMessages(); // refresh with DB times/history
+              await loadMessages();
             }
             curEvent = null; curData = null;
             await autoScroll();
@@ -319,6 +325,17 @@
       persistConversation();
       await autoScroll();
     }
+  }
+
+  /* ===== Improved past conversations UI ===== */
+  let convQuery = '';
+  $: filteredConversations = conversations.filter(c =>
+    (c.title || '').toLowerCase().includes(convQuery.trim().toLowerCase())
+  );
+
+  function displayWhen(c: Conversation) {
+    const t = c.last_message_at || c.updated_at || c.created_at;
+    try { return new Date(t || Date.now()).toLocaleString() } catch { return ''; }
   }
 </script>
 
@@ -338,24 +355,6 @@
     </div>
   </div>
 
-  <!-- Past conversations: visible even if structure is missing -->
-  {#if uploadedFileId && conversations.length}
-    <div class="flex flex-wrap items-center gap-2">
-      <span class="text-xs text-gray-600">Past conversations</span>
-      <select class="rounded-xl border px-2 py-1 text-sm min-w-[260px]" bind:value={selectedConversationId}>
-        {#each conversations as c}
-          <option value={c.id}>
-            {c.title || 'Conversation'} ·
-            {new Date(c.last_message_at || c.created_at || Date.now()).toLocaleString()} ·
-            {(c.message_count ?? 0)} msgs
-          </option>
-        {/each}
-      </select>
-      <button class="px-2 py-1 rounded-xl border text-sm hover:bg-gray-50" on:click={openSelectedConversation}>
-        Open
-      </button>
-    </div>
-  {/if}
 
   {#if uploadedFileId && folderSaved && !conversationId}
     <button
@@ -411,11 +410,10 @@
               </div>
             </div>
           {:else}
-            <!-- Inline activity -->
             <div class="px-4 py-2">
               <div class="relative rounded-xl border border-sky-200 bg-sky-50/50 overflow-hidden">
                 {#if row.active || isThinking}
-                  <div class="absolute right-2 top-2 flex items-center gap-2 text-[11px] text-sky-700">
+                  <div class="absolute right-4 bottom-4 flex items-center gap-2 text-[11px] text-sky-700">
                     <span class="w-3.5 h-3.5 border-2 border-sky-200 border-t-sky-600 rounded-full animate-spin"></span>
                     processing
                   </div>
@@ -479,4 +477,49 @@
       </button>
     </div>
   </div>
+
+  <!-- Past conversations (keeps original select; adds quick search + cards) -->
+  {#if uploadedFileId && conversations.length}
+    <div class="flex flex-col gap-2">
+      <div class="flex flex-wrap items-center gap-2">
+        <span class="text-xs text-gray-600">Past conversations</span>
+        <select class="rounded-xl border px-2 py-1 text-sm min-w-[260px]" bind:value={selectedConversationId}>
+          {#each conversations as c}
+            <option value={c.id}>
+              {(c.title || 'Conversation')} | {displayWhen(c)} | {(c.message_count ?? 0)} msgs
+            </option>
+          {/each}
+        </select>
+        <button class="px-2 py-1 rounded-xl border text-sm hover:bg-gray-50" on:click={openSelectedConversation}>
+          Open
+        </button>
+      </div>
+
+      <!-- Nicer browse UI -->
+      <!-- <div class="rounded-xl border bg-gray-50 p-3">
+        <div class="flex items-center gap-2 mb-2">
+          <input
+            class="flex-1 rounded-lg border px-3 py-1.5 text-sm"
+            placeholder="Search chats…"
+            bind:value={convQuery}
+          />
+        </div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+          {#each filteredConversations.slice(0, 12) as c}
+            <button
+              class="text-left border rounded-xl bg-white hover:bg-gray-50 p-3 transition group"
+              on:click={() => { selectedConversationId = c.id; openSelectedConversation(); }}
+              title={c.title || 'Conversation'}>
+              <div class="flex items-start justify-between gap-2">
+                <div class="font-medium truncate">{c.title || 'Conversation'}</div>
+                <span class="text-[10px] px-1.5 py-0.5 rounded bg-gray-100">{(c.message_count ?? 0)} msg{(c.message_count ?? 0) === 1 ? '' : 's'}</span>
+              </div>
+              <div class="text-xs text-gray-500 mt-1 truncate">{displayWhen(c)}</div>
+              <div class="mt-2 text-[11px] text-gray-600 truncate">{c.zip_file_id || ''}</div>
+            </button>
+          {/each}
+        </div>
+      </div> -->
+    </div>
+  {/if}
 </div>
