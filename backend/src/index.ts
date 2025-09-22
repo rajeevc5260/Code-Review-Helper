@@ -101,51 +101,49 @@ function toPosInt(v: unknown, fallback: number) {
 let ORIGINAL_ROOT_LOCATION: string | null = null;
 
 function validateLocation(location: string, rootLocation: string): string {
-    // Ensure the location always starts with or is the rootLocation
-    if (!location || typeof location !== "string") {
-        return rootLocation;
-    }
+    if (isUnknownPath(location)) return rootLocation;
 
-    // If location is exactly the rootLocation, use it
-    if (location === rootLocation) {
+    // Normalize
+    const cleanLocation = location.replace(/^[\\/]+/, ""); // remove leading slashes
+    const cleanRoot = rootLocation.replace(/[\\/]+$/, ""); // remove trailing slashes
+
+    // If already absolute under root, keep it; else, prefix with root
+    if (location === cleanRoot || location.startsWith(cleanRoot + "/")) {
         return location;
     }
-
-    // If location starts with rootLocation, use it as is
-    if (location.startsWith(rootLocation)) {
-        return location;
-    }
-
-    // If location doesn't start with rootLocation, prepend it
-    const cleanLocation = location.startsWith('/') ? location.slice(1) : location;
-    const cleanRoot = rootLocation.endsWith('/') ? rootLocation.slice(0, -1) : rootLocation;
     return `${cleanRoot}/${cleanLocation}`;
 }
 
 async function listFilesTool(args: any) {
+    requireRoot();
     const { location } = args ?? {};
-    if (!location || typeof location !== "string") {
-        throw new Error("listFiles: 'location' is required");
+    if (isUnknownPath(location)) {
+        throw new Error("listFiles: invalid 'location' (unknown/empty).");
     }
 
-    // Validate location against the original root location
-    const validatedLocation = ORIGINAL_ROOT_LOCATION
-        ? validateLocation(location, ORIGINAL_ROOT_LOCATION)
-        : location;
+    // Enforce root prefix
+    const validatedLocation = validateLocation(String(location), ORIGINAL_ROOT_LOCATION!);
+
+    // Extra guard: must start with root
+    if (!validatedLocation.startsWith(ORIGINAL_ROOT_LOCATION!)) {
+        throw new Error(`listFiles: location must start with root '${ORIGINAL_ROOT_LOCATION}'`);
+    }
 
     const limit = Math.min(100, toPosInt(args?.limit, 100));
     const page = toPosInt(args?.page, 1);
 
-    console.log("listFilesTool", { originalLocation: location, validatedLocation, limit, page, rootLocation: ORIGINAL_ROOT_LOCATION });
-
-    const resp = await namespace.getFiles?.({
-        location: validatedLocation,
+    console.log("listFilesTool", {
+        originalLocation: location,
+        validatedLocation,
         limit,
         page,
+        rootLocation: ORIGINAL_ROOT_LOCATION
     });
 
+    const resp = await namespace.getFiles?.({ location: validatedLocation, limit, page });
     return resp ?? { files: [], folders: [], page, totalPages: 1, total: 0 };
 }
+
 
 async function getDownloadUrlTool(args: any) {
     const { fileId, expiry = "1h" } = args ?? {};
@@ -229,6 +227,20 @@ const fnReadFileText: FunctionDeclaration = {
     },
 };
 
+function hasRealRoot(): boolean {
+    return !!ORIGINAL_ROOT_LOCATION && ORIGINAL_ROOT_LOCATION !== "(unknown)";
+}
+
+function requireRoot() {
+    if (!hasRealRoot()) {
+        throw new Error("rootLocation is not set; cannot proceed.");
+    }
+}
+
+function isUnknownPath(s: string | null | undefined) {
+    return !s || typeof s !== "string" || s.trim() === "" || s.trim() === "(unknown)";
+}
+
 
 // SSE review endpoint
 app.post("/ai/review/stream", async (req, res) => {
@@ -288,8 +300,46 @@ app.post("/ai/review/stream", async (req, res) => {
         }
 
         // Set the original root location globally
-        const rootLocation = folderStructure?.rootLocation ? String(folderStructure.rootLocation) : "(unknown)";
-        ORIGINAL_ROOT_LOCATION = rootLocation !== "(unknown)" ? rootLocation : null;
+        // --- Patch 4: Resolve rootLocation with DB fallback and set ORIGINAL_ROOT_LOCATION ---
+        let rootLocation: string | null = null;
+
+        function isUnknownPath(s: string | null | undefined) {
+            return !s || typeof s !== "string" || s.trim() === "" || s.trim() === "(unknown)";
+        }
+        function hasRealRoot(): boolean {
+            return !!ORIGINAL_ROOT_LOCATION && ORIGINAL_ROOT_LOCATION !== "(unknown)";
+        }
+
+        // Prefer JSON root from saved structure
+        const jsonRoot = folderStructure?.rootLocation ? String(folderStructure.rootLocation) : null;
+
+        try {
+            if (jsonRoot && !isUnknownPath(jsonRoot)) {
+                rootLocation = jsonRoot;
+            } else {
+                // Fallback to DB column review_zip.root_location
+                const r2 = await pool.query(
+                    `SELECT root_location FROM review_zip WHERE zip_file_id = $1 AND user_id = $2 LIMIT 1`,
+                    [zipFileId, userId]
+                );
+                const dbRoot = r2.rowCount ? (r2.rows[0]?.root_location as string | null) : null;
+                if (dbRoot && !isUnknownPath(dbRoot)) {
+                    rootLocation = dbRoot;
+                }
+            }
+        } catch (e: any) {
+            sendError("Failed while resolving rootLocation", { error: e?.message || String(e) });
+        }
+
+        ORIGINAL_ROOT_LOCATION = rootLocation && !isUnknownPath(rootLocation) ? rootLocation : null;
+        console.log("Setting ORIGINAL_ROOT_LOCATION to:", ORIGINAL_ROOT_LOCATION);
+
+        // Hard-fail if we still don't have a real root
+        if (!hasRealRoot()) {
+            sendError("Missing rootLocation — cannot analyze. Ensure the upload saved a valid root.");
+            send("finished", { status: "failed", timestamp: Date.now(), message: "Aborted: no valid rootLocation" });
+            return res.end();
+        }
 
         console.log("Setting ORIGINAL_ROOT_LOCATION to:", ORIGINAL_ROOT_LOCATION);
 
@@ -375,6 +425,7 @@ app.post("/ai/review/stream", async (req, res) => {
             "- Keep in mind that no need of answering all questions asked by user only as for the latest one if he asks about any older thing try to use that from history as well",
             `- NEVER change the root location ${rootLocation} - this is where all navigation starts from`,
             "- Always validate that your location parameters start with the root location",
+            "- Note: Do not mention tools call or any internal function call details in final response because function calls are only for your processing purpose dont expose it to the user.",
         ].join('\\n');
 
 
@@ -407,9 +458,9 @@ app.post("/ai/review/stream", async (req, res) => {
         });
 
         // 🔧 seed the model if it didn't call any tools initially
-        if (!(response.functionCalls?.length) && ORIGINAL_ROOT_LOCATION) {
+        if (!(response.functionCalls?.length) && hasRealRoot()) {
             sendProgress("No tool calls in first turn — seeding with a root folder listing");
-            const args = { location: ORIGINAL_ROOT_LOCATION, limit: 100, page: 1 };
+            const args = { location: ORIGINAL_ROOT_LOCATION!, limit: 100, page: 1 };
             console.log("Seeding with rootLocation:", ORIGINAL_ROOT_LOCATION);
             const listing = await listFilesTool(args);
             history.push({ role: "model", parts: [{ functionCall: { name: "listFiles", args } }] });
@@ -425,6 +476,7 @@ app.post("/ai/review/stream", async (req, res) => {
                 },
             });
         }
+
 
 
         // tool loop — process ALL calls per round
@@ -537,12 +589,7 @@ app.post("/ai/review/stream", async (req, res) => {
             ].join("\n");
         }
 
-        const markdownResponse = `# Code Review Analysis
-        ${finalText}
-
-        ---
-
-        *Analysis completed at ${new Date().toISOString()}*`;
+        const markdownResponse = finalText;
 
         send("analysis_result", { timestamp: Date.now(), message: markdownResponse });
 
