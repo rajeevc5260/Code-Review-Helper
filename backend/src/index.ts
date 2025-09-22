@@ -97,6 +97,7 @@ function isProbablyText(name: string) {
 
 async function listFilesTool(args: any) {
   const { location, query, limit, page } = args ?? {};
+  console.log("listFilesTool", { location, query, limit, page });
   const resp = await namespace.getFiles?.({
     location,
     query,
@@ -391,6 +392,7 @@ app.post("/ai/review/stream", async (req, res) => {
       "   • In the first call, always try to do a full scan of the entire project to get clear overview.",
       "2) listFiles({ location, query?, limit?, page? })",
       "   • List immediate children of a folder. Use to drill down when you already know a folder path.",
+      "   • Maximum limit is 100 per page for listFiles.",
       "3) readFileText({ fileId, name, maxBytes? })",
       "   • Read text content. ALWAYS pass the exact fileId + name you located via finder/listing.",
       "4) getDownloadUrl({ fileId, expiry? })",
