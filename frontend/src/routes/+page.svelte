@@ -540,7 +540,7 @@
                   <span class={`font-mono text-[11px] px-2 py-0.5 rounded ${stepBadge(uploadStatus)}`}>upload_{uploadStatus}</span>
                   <span class="text-[11px] text-gray-500 truncate">{file?.name || '—'}</span>
                 </div>
-                <div class="mt-1 truncate">
+                <div class="mt-1 truncate text-xs">
                   {#if uploadStatus === 'active'}Uploading zip… ({uploadPct}%)
                   {:else if uploadStatus === 'complete'}{uploadMsg || 'Zip uploaded'}
                   {:else if uploadStatus === 'error'}{uploadMsg}
@@ -561,7 +561,7 @@
                     <span class="text-[11px] text-gray-500">working{'.'.repeat(unzipSpinnerTick)}</span>
                   {/if}
                 </div>
-                <div class="mt-1 truncate">
+                <div class="mt-1 truncate text-xs">
                   {#if unzipStatus === 'active'}Extracting files…
                   {:else if unzipStatus === 'complete'}{extractMsg}
                   {:else if unzipStatus === 'error'}{extractMsg}
@@ -582,7 +582,7 @@
                     <span class="text-[11px] text-gray-500">checking{'.'.repeat(verifySpinnerTick)}</span>
                   {/if}
                 </div>
-                <div class="mt-1 truncate">
+                <div class="mt-1 truncate text-xs">
                   {#if verifyStatus === 'active'}Verifying file status…
                   {:else if verifyStatus === 'complete'}Ready
                   {:else}Waiting{/if}
@@ -600,11 +600,11 @@
                   <span class={`font-mono text-[11px] px-2 py-0.5 rounded ${stepBadge(listStatus)}`}>list_{listStatus}</span>
                   <span class="text-[11px] text-gray-500 truncate">{listLocation || '—'}</span>
                 </div>
-                <div class="mt-1 truncate">
+                <div class="mt-1 truncate text-xs">
                   {#if listStatus === 'active'}Listing extracted folder…
-                  {:else if listStatus === 'complete'}{listMsg}
-                  {:else if listStatus === 'error'}{listMsg}
-                  {:else}Run “Upload & Extract” first{/if}
+                  {:else if listStatus === 'complete'}{listMsg || 'Files listed'}
+                  {:else if listStatus === 'error'}{listMsg || 'List failed'}
+                  {:else}Files listed{/if}
                 </div>
 
                 <!-- compact advanced controls -->
@@ -612,10 +612,10 @@
                   <details class="mt-2">
                     <summary class="text-xs text-gray-600 cursor-pointer">advanced</summary>
                     <div class="pt-2 flex flex-wrap gap-2 items-center">
-                      <input class="flex-1 min-w-[160px] rounded-xl border px-3 py-2 text-sm" bind:value={listLocation} placeholder="CodeZips/&lt;run&gt;/&lt;zipBase&gt;" />
-                      <input class="w-20 rounded-xl border px-3 py-2 text-sm" type="number" min="1" max="100" bind:value={listLimit} />
-                      <input class="w-20 rounded-xl border px-3 py-2 text-sm" type="number" min="1" bind:value={listPage} />
-                      <button class="px-3 py-2 rounded-xl border text-sm hover:bg-gray-50 disabled:opacity-60" on:click={() => refreshList()} disabled={listBusy}>
+                      <input class="flex-1 min-w-[160px] rounded-xl border border-gray-200 px-2 py-1 text-xs" bind:value={listLocation} placeholder="CodeZips/&lt;run&gt;/&lt;zipBase&gt;" />
+                      <input class="w-20 rounded-xl border border-gray-200 px-2 py-1 text-xs" type="number" min="1" max="100" bind:value={listLimit} />
+                      <input class="w-20 rounded-xl border border-gray-200 px-2 py-1 text-xs" type="number" min="1" bind:value={listPage} />
+                      <button class="px-2 py-1 rounded-xl border text-sm hover:bg-gray-50 disabled:opacity-60" on:click={() => refreshList()} disabled={listBusy}>
                         {listBusy ? 'Listing…' : 'Refresh List'}
                       </button>
                     </div>
@@ -634,7 +634,7 @@
                   <span class={`font-mono text-[11px] px-2 py-0.5 rounded ${stepBadge(saveStatus)}`}>save_{saveStatus}</span>
                   <span class="text-[11px] text-gray-500 truncate">{uploadedFileId || '—'}</span>
                 </div>
-                <div class="mt-1 truncate">
+                <div class="mt-1 truncate text-xs">
                   {#if saveStatus === 'active'}Saving project structure…
                   {:else if saveStatus === 'complete'}{saveMsg || 'Structure saved'}
                   {:else if saveStatus === 'error'}{saveMsg || 'Save failed'}
