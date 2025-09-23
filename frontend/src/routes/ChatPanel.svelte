@@ -46,6 +46,8 @@
   $: isDisconnected = !!uploadedFileId && !folderSaved;
 
   const CONV_KEY = (u: string, fid: string) => `acr:conv:${u}:${fid}`;
+  const SEL_KEY  = (u: string, fid: string) => `acr:convsel:${u}:${fid}`;
+
   function persistConversation() {
     if (conversationId && uploadedFileId) {
       try { sessionStorage.setItem(CONV_KEY(userId, uploadedFileId), conversationId); } catch {}
@@ -61,6 +63,13 @@
       }
     } catch {}
   }
+  function hydrateSelectedId(): string | null {
+    if (!uploadedFileId) return null;
+    try { return sessionStorage.getItem(SEL_KEY(userId, uploadedFileId)) || null; } catch { return null; }
+  }
+  $: if (uploadedFileId && selectedConversationId) {
+    try { sessionStorage.setItem(SEL_KEY(userId, uploadedFileId), selectedConversationId); } catch {}
+  }
 
   onMount(() => {
     hydrateConversation();
@@ -74,8 +83,13 @@
       const d = await r.json();
       if (r.ok && Array.isArray(d?.conversations)) {
         conversations = d.conversations;
-        if (!selectedConversationId && conversations.length) {
-          selectedConversationId = conversations[0].id;
+        if (!selectedConversationId) {
+          const savedSel = hydrateSelectedId();
+          if (savedSel && conversations.some(c => c.id === savedSel)) {
+            selectedConversationId = savedSel;
+          } else if (conversations.length) {
+            selectedConversationId = conversations[0].id;
+          }
         }
       }
     } catch {}
@@ -85,6 +99,26 @@
   $: if (uploadedFileId && uploadedFileId !== lastZipForList) {
     lastZipForList = uploadedFileId;
     loadConversationList();
+  }
+
+  /* HARD RESET when a different zip is selected */
+  let lastZipSeen: string | null = null;
+  $: if ((uploadedFileId ?? null) !== lastZipSeen) {
+    lastZipSeen = uploadedFileId ?? null;
+    timeline = [];
+    conversationId = null;
+    selectedConversationId = null;
+    assistantDraft = '';
+    input = '';
+    connecting = false;
+    activeActivityIdx = null;
+    evtId = 0;
+    isThinking = false;
+    if (uploadedFileId) {
+      hydrateConversation();
+    } else {
+      conversations = [];
+    }
   }
 
   async function openSelectedConversation() {
@@ -119,7 +153,7 @@
       const items = block.trim().split('\n').map((line) => line.replace(/^\s*[-*] (.*)$/, '<li>$1</li>')).join('');
       return `<ul class="list-disc pl-5 my-2 space-y-1">${items}</ul>`;
     });
-    out = out.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noreferrer" class="underline text-blue-600">$1</a>');
+    out = out.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noreferrer" class="underline">$1</a>');
     out = out.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
     out = out.replace(/(^|[^\*])\*(.*?)\*(?!\*)/g, '$1<em>$2</em>');
     out = out.replace(/`([^`]+)`/g, '<code class="px-1 py-0.5 rounded bg-gray-100 border">$1</code>');
@@ -190,8 +224,12 @@
   }
 
   const Icon = {
-    user: () => `<svg viewBox="0 0 24 24" class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.7"><path stroke-linecap="round" stroke-linejoin="round" d="M15 19a6 6 0 10-6 0m6-11a3 3 0 11-6 0 3 3 0 016 0Z"/></svg>`,
-    assistant: () => `<svg viewBox="0 0 24 24" class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.7"><path stroke-linecap="round" stroke-linejoin="round" d="M12 3v3m0 12v3m9-9h-3M6 12H3m13.95 5.95-2.12-2.12M8.17 8.17 6.05 6.05m11.9 0-2.12 2.12M8.17 15.83 6.05 17.95"/></svg>`,
+    user: () => `<svg viewBox="0 0 24 24" class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2">
+      <path stroke-linecap="round" stroke-linejoin="round" d="M12 12a4 4 0 100-8 4 4 0 000 8zM4 20a8 8 0 1116 0v1H4v-1z"/></svg>`,
+
+    // simple outlined brain
+    assistant: () => `<svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" viewBox="0 0 640 640"><path fill="#ffffff" d="M264 64C227.4 64 196.5 88.6 187 122.1C139.6 131.8 104 173.7 104 224C104 235.3 105.8 246.2 109.1 256.3C86.4 275.4 72 304 72 336C72 359.7 80 381.6 93.3 399.1C89.8 409.5 88 420.5 88 432C88 486 129.2 530.5 181.9 535.5C197.5 559.8 224.8 576 256 576C281.2 576 304 565.4 320 548.4C336 565.4 358.8 576 384 576C415.1 576 442.4 559.8 458.1 535.5C510.8 530.4 552 486 552 432C552 420.5 550.1 409.5 546.7 399.1C560.1 381.6 568 359.7 568 336C568 304 553.5 275.4 530.9 256.3C534.2 246.1 536 235.2 536 224C536 173.7 500.4 131.8 453 122.1C443.5 88.6 412.6 64 376 64C354.2 64 334.4 72.7 320 86.9C305.6 72.8 285.8 64 264 64zM296 144L296 491.1C295.9 491.7 295.8 492.3 295.7 493C293.2 512.7 276.4 528 256 528C239.2 528 224.8 517.7 218.9 502.9C215.1 493.3 205.6 487.3 195.3 487.9C194.2 488 193.1 488 192.1 488C161.2 488 136.1 462.9 136.1 432C136.1 422.5 138.5 413.5 142.6 405.7C147.7 396.1 145.7 384.3 137.8 376.9C126.8 366.7 120 352.1 120 336C120 314.4 132.2 295.6 150.3 286.2C156.2 283.2 160.5 277.8 162.3 271.5C164.1 265.2 163.2 258.3 159.8 252.6C154.8 244.2 151.9 234.5 151.9 224C151.9 193.1 177 168 207.9 168C221.2 168 231.9 157.3 231.9 144C231.9 126.3 246.2 112 263.9 112C281.6 112 295.9 126.3 295.9 144zM344 491.1L344 144C344 126.3 358.3 112 376 112C393.7 112 408 126.3 408 144C408 157.3 418.7 168 432 168C462.9 168 488 193.1 488 224C488 234.5 485.1 244.3 480.1 252.6C476.7 258.3 475.8 265.1 477.6 271.5C479.4 277.9 483.8 283.2 489.6 286.2C507.6 295.5 519.9 314.3 519.9 336C519.9 352.1 513.1 366.7 502.1 376.9C494.2 384.3 492.2 396.1 497.3 405.7C501.5 413.5 503.8 422.4 503.8 432C503.8 462.9 478.7 488 447.8 488C446.7 488 445.6 488 444.6 487.9C434.3 487.3 424.8 493.4 421 502.9C415.1 517.6 400.6 528 383.9 528C363.5 528 346.7 512.7 344.2 493C344.1 492.4 344 491.7 343.9 491.1z"/></svg>`,
+
     bolt: () => `<svg viewBox="0 0 24 24" class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.7"><path stroke-linecap="round" stroke-linejoin="round" d="M13 3L4 14h7l-1 7 9-11h-7l1-7z"/></svg>`
   };
 
@@ -199,7 +237,6 @@
     if (!folderSaved || !uploadedFileId) return;
     const r = await fetch(`${backendUrl}/chat/start`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      /* ✅ send the file name (zip base) as the title */
       body: JSON.stringify({ userId, zipFileId: uploadedFileId, title: (chatTitle || '').trim() || undefined })
     });
     const d = await r.json();
@@ -207,7 +244,6 @@
     conversationId = d.conversationId;
     persistConversation();
 
-    /* add to list immediately with the chosen title */
     conversations = [
       {
         id: conversationId ?? '',
@@ -339,137 +375,131 @@
   }
 </script>
 
-<div class="border rounded-2xl p-5 space-y-4 bg-white">
-  <div class="flex items-center justify-between">
-    <h2 class="text-lg font-semibold">Code Review Chat</h2>
-    <div class="text-xs text-gray-600">
-      {#if !uploadedFileId}
-        Upload & extract a zip to begin
-      {:else if isDisconnected}
-        Disconnected — structure not saved (read-only)
-      {:else if !conversationId}
-        Ready to start
-      {:else}
-        Connected to conversation
-      {/if}
-    </div>
+<!-- Status + start button (small and subtle) -->
+<div class="mb-2 flex items-center justify-between">
+  <div class="text-xs text-gray-600 font-light">
+    {#if !uploadedFileId}
+      Upload & extract a zip to begin
+    {:else if isDisconnected}
+      Disconnected — structure not saved (read-only)
+    {:else if !conversationId}
+      Ready to start
+    {:else}
+      Connected to conversation
+    {/if}
   </div>
-
 
   {#if uploadedFileId && folderSaved && !conversationId}
     <button
-      class="px-4 py-2 rounded-xl bg-gray-900 text-white text-sm font-medium hover:bg-black"
+      class="px-3 py-1.5 rounded-lg bg-gray-900 text-white text-xs font-medium hover:bg-black"
       on:click={startChat}>
       Start new chat
     </button>
   {/if}
+</div>
 
-  <div class="border rounded-xl overflow-hidden">
-    <div class="px-4 py-2 border-b bg-gray-50 text-sm font-medium">Conversation</div>
-
-    <div class="max-h-[70vh] overflow-y-auto divide-y" bind:this={streamContainer}>
-      {#if !conversationId}
-        <div class="py-16 text-center text-sm text-gray-500">
-          {#if isDisconnected}
-            Project structure is not saved. You can open a past conversation above to read its history.
-          {:else}
-            Start a chat to ask questions about your codebase
-          {/if}
-        </div>
-      {:else if timeline.length === 0}
-        <div class="py-16 text-center text-sm text-gray-500">No messages yet.</div>
-      {:else}
-        {#each timeline as row, idx}
-          {#if row.kind === 'msg'}
-            <div class="p-4">
-              <div class="flex items-start gap-3">
-                <div class="shrink-0 mt-1">
-                  {#if row.role === 'user'}
-                    <div class="w-7 h-7 rounded-full bg-indigo-600 text-white grid place-items-center shadow ring-2 ring-indigo-200" aria-hidden="true">
-                      {@html Icon.user()}
-                    </div>
-                  {:else}
-                    <div class="w-7 h-7 rounded-full bg-emerald-600 text-white grid place-items-center shadow ring-2 ring-emerald-200" aria-hidden="true">
-                      {@html Icon.assistant()}
-                    </div>
-                  {/if}
-                </div>
-                <div class="flex-1">
-                  {#if row.role === 'assistant'}
-                    <div class="rounded-xl border bg-emerald-50/60 border-emerald-200 p-3">
-                      <div class="markdown-body text-[13px] leading-6">
-                        {@html mdToHtml(row.content)}
-                      </div>
-                    </div>
-                  {:else}
-                    <div class="rounded-xl border bg-indigo-50/60 border-indigo-200 p-3 text-sm whitespace-pre-wrap">
-                      {row.content}
-                    </div>
-                  {/if}
-                </div>
+<!-- CHAT CARD (light tones + bordered container) -->
+<div class="rounded-2xl border border-gray-200 bg-white overflow-hidden">
+  <!-- Messages -->
+  <div class="max-h-[64vh] min-h-[290px] overflow-y-auto space-y-4 p-4 font-light" bind:this={streamContainer}>
+    {#if !conversationId}
+      <div class="py-32 text-center text-sm text-gray-500 font-light">
+        {#if isDisconnected}
+          Project structure is not saved. You can open a past conversation above to read its history.
+        {:else}
+          Start a chat to ask questions about your codebase
+        {/if}
+      </div>
+    {:else if timeline.length === 0}
+      <div class="py-32 text-center text-sm text-gray-500">No messages yet.</div>
+    {:else}
+      {#each timeline as row, idx}
+        {#if row.kind === 'msg'}
+          {#if row.role === 'user'}
+            <!-- USER (left) -->
+            <div class="flex items-start gap-3 justify-end">
+              <div class="max-w-[78%] rounded-2xl border border-indigo-100 bg-indigo-50/50 px-4 py-2 text-[13px] text-indigo-900 shadow-sm">
+                {row.content}
+              </div>
+              <div class="w-9 h-9 rounded-full bg-gradient-to-br from-indigo-400 to-violet-500 text-white grid place-items-center shadow ring-2 ring-indigo-100 shrink-0" aria-hidden="true">
+                {@html Icon.user()}
               </div>
             </div>
           {:else}
-            <div class="px-4 py-2">
-              <div class="relative rounded-xl border border-sky-200 bg-sky-50/50 overflow-hidden">
-                {#if row.active || isThinking}
-                  <div class="absolute right-4 bottom-4 flex items-center gap-2 text-[11px] text-sky-700">
-                    <span class="w-3.5 h-3.5 border-2 border-sky-200 border-t-sky-600 rounded-full animate-spin"></span>
-                    processing
+            <!-- ASSISTANT (right) -->
+            <div class="flex items-start gap-3">
+              <div class="w-9 h-9 rounded-full bg-gradient-to-br from-emerald-400 to-teal-500 text-white grid place-items-center shadow ring-2 ring-emerald-100 shrink-0" aria-hidden="true">
+                {@html Icon.assistant()}
+              </div>
+              <div class="max-w-[78%] rounded-2xl px-4 py-2 text-[13px] text-gray-900 border border-emerald-100 bg-emerald-50/50 shadow-sm">
+                <div class="leading-6">
+                  {@html mdToHtml(row.content)}
+                </div>
+              </div>
+            </div>
+          {/if}
+        {:else}
+          <!-- Activity events row -->
+          <div class="relative rounded-xl border border-sky-200 bg-sky-50/50 overflow-hidden">
+            {#if row.active || isThinking}
+              <div class="absolute right-3 bottom-3 flex items-center gap-2 text-[11px] text-sky-700">
+                <span class="w-3.5 h-3.5 border-2 border-sky-200 border-t-sky-600 rounded-full animate-spin"></span>
+                processing
+              </div>
+            {/if}
+            <ul class="divide-y">
+              {#each row.events.filter(e => e.type !== 'analysis_result') as ev (ev.id)}
+                <li class={`p-3 text-[13px] ${eventStripeClasses(ev.type)}`}>
+                  <div class="flex items-start gap-2">
+                    <div class="mt-0.5 shrink-0 text-sky-700" aria-hidden="true">
+                      {@html Icon.bolt()}
+                    </div>
+                    <div class="min-w-0 flex-1">
+                      <div class="flex items-center justify-between gap-2">
+                        <span class={`font-mono text-[11px] px-2 py-0.5 rounded ${eventBadgeClasses(ev.type)}`}>{ev.type}</span>
+                        <span class="text-[11px] text-gray-500">{new Date(ev.time).toLocaleTimeString()}</span>
+                      </div>
+                      <div class="mt-1">{eventTitle(ev)}</div>
+                      {#if ev.data?.summary}
+                        <pre class="mt-2 text-[11px] bg-white/60 border rounded p-2 overflow-auto">{JSON.stringify(ev.data.summary, null, 2)}</pre>
+                      {/if}
+                      {#if ev.data?.parameters}
+                        <details class="mt-2">
+                          <summary class="text-xs text-gray-600 cursor-pointer">details</summary>
+                          <pre class="mt-1 text-[11px] bg-white/60 border rounded p-2 overflow-auto">{JSON.stringify(ev.data.parameters, null, 2)}</pre>
+                        </details>
+                      {/if}
+                      {#if ev.data?.error}
+                        <div class="mt-2 text-xs text-rose-700 break-all">{String(ev.data.error)}</div>
+                      {/if}
+                    </div>
                   </div>
-                {/if}
-                <ul class="divide-y">
-                  {#each row.events.filter(e => e.type !== 'analysis_result') as ev (ev.id)}
-                    <li class={`p-3 text-[13px] ${eventStripeClasses(ev.type)}`}>
-                      <div class="flex items-start gap-2">
-                        <div class="mt-0.5 shrink-0 text-sky-700" aria-hidden="true">
-                          {@html Icon.bolt()}
-                        </div>
-                        <div class="min-w-0 flex-1">
-                          <div class="flex items-center justify-between gap-2">
-                            <span class={`font-mono text-[11px] px-2 py-0.5 rounded ${eventBadgeClasses(ev.type)}`}>{ev.type}</span>
-                            <span class="text-[11px] text-gray-500">{new Date(ev.time).toLocaleTimeString()}</span>
-                          </div>
-                          <div class="mt-1">{eventTitle(ev)}</div>
-                          {#if ev.data?.summary}
-                            <pre class="mt-2 text-[11px] bg-white/60 border rounded p-2 overflow-auto">{JSON.stringify(ev.data.summary, null, 2)}</pre>
-                          {/if}
-                          {#if ev.data?.parameters}
-                            <details class="mt-2">
-                              <summary class="text-xs text-gray-600 cursor-pointer">details</summary>
-                              <pre class="mt-1 text-[11px] bg-white/60 border rounded p-2 overflow-auto">{JSON.stringify(ev.data.parameters, null, 2)}</pre>
-                            </details>
-                          {/if}
-                          {#if ev.data?.error}
-                            <div class="mt-2 text-xs text-rose-700 break-all">{String(ev.data.error)}</div>
-                          {/if}
-                        </div>
-                      </div>
-                    </li>
-                  {/each}
-                </ul>
-              </div>
-            </div>
-          {/if}
-        {/each}
-      {/if}
-    </div>
+                </li>
+              {/each}
+            </ul>
+          </div>
+        {/if}
+      {/each}
+    {/if}
+  </div>
 
-    <div class="p-3 border-t flex gap-2 items-end">
+  <!-- Composer -->
+  <div class="p-3 border-t border-gray-200 bg-gray-50">
+    <div class="flex gap-2 relative">
       <textarea
-        class="flex-1 rounded-xl border px-3 py-2 text-sm min-h-[44px] focus:outline-none focus:ring-2 focus:ring-indigo-300 disabled:bg-gray-50 disabled:text-gray-400"
+        class="flex-1 rounded-xl border border-gray-200 px-4 py-2.5 text-sm min-h-[66px] bg-white focus:outline-none focus:ring-2 focus:ring-indigo-300 disabled:bg-gray-50 disabled:text-gray-400 placeholder:text-xs"
         rows="2"
         placeholder={
           !folderSaved
             ? "Project structure missing — read-only. Open a past conversation to view history."
-            : (conversationId ? "Ask something about your code…" : "Start the chat first")
+            : (conversationId ? "Shift+Enter = newline • Enter = send" : "Start the chat first")
         }
         bind:value={input}
         disabled={!canChat || connecting}
         on:keydown={(e) => { if (folderSaved && e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } }}
       ></textarea>
       <button
-        class="h-10 min-w-[92px] px-4 rounded-lg bg-gray-900 text-white text-sm font-medium hover:bg-black disabled:opacity-60 disabled:cursor-not-allowed self-center"
+        class="h-8 min-w-[60px] px-4 rounded-xl bg-gray-900 text-white text-sm font-medium hover:bg-black disabled:opacity-60 disabled:cursor-not-allowed self-end absolute right-2 bottom-2"
         on:click={sendMessage}
         disabled={!canChat || !input.trim() || connecting}
       >
@@ -477,49 +507,23 @@
       </button>
     </div>
   </div>
-
-  <!-- Past conversations (keeps original select; adds quick search + cards) -->
-  {#if uploadedFileId && conversations.length}
-    <div class="flex flex-col gap-2">
-      <div class="flex flex-wrap items-center gap-2">
-        <span class="text-xs text-gray-600">Past conversations</span>
-        <select class="rounded-xl border px-2 py-1 text-sm min-w-[260px]" bind:value={selectedConversationId}>
-          {#each conversations as c}
-            <option value={c.id}>
-              {(c.title || 'Conversation')} | {displayWhen(c)} | {(c.message_count ?? 0)} msgs
-            </option>
-          {/each}
-        </select>
-        <button class="px-2 py-1 rounded-xl border text-sm hover:bg-gray-50" on:click={openSelectedConversation}>
-          Open
-        </button>
-      </div>
-
-      <!-- Nicer browse UI -->
-      <!-- <div class="rounded-xl border bg-gray-50 p-3">
-        <div class="flex items-center gap-2 mb-2">
-          <input
-            class="flex-1 rounded-lg border px-3 py-1.5 text-sm"
-            placeholder="Search chats…"
-            bind:value={convQuery}
-          />
-        </div>
-        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
-          {#each filteredConversations.slice(0, 12) as c}
-            <button
-              class="text-left border rounded-xl bg-white hover:bg-gray-50 p-3 transition group"
-              on:click={() => { selectedConversationId = c.id; openSelectedConversation(); }}
-              title={c.title || 'Conversation'}>
-              <div class="flex items-start justify-between gap-2">
-                <div class="font-medium truncate">{c.title || 'Conversation'}</div>
-                <span class="text-[10px] px-1.5 py-0.5 rounded bg-gray-100">{(c.message_count ?? 0)} msg{(c.message_count ?? 0) === 1 ? '' : 's'}</span>
-              </div>
-              <div class="text-xs text-gray-500 mt-1 truncate">{displayWhen(c)}</div>
-              <div class="mt-2 text-[11px] text-gray-600 truncate">{c.zip_file_id || ''}</div>
-            </button>
-          {/each}
-        </div>
-      </div> -->
-    </div>
-  {/if}
 </div>
+
+<!-- Past conversations -->
+{#if uploadedFileId && conversations.length}
+  <div class="mt-2 flex flex-col gap-2">
+    <div class="flex flex-wrap items-center gap-2">
+      <span class="text-xs text-gray-600">Past conversations</span>
+      <select class="rounded-xl border border-gray-200 px-4 py-2 text-gray-600 text-xs min-w-[260px]" bind:value={selectedConversationId} placeholder="Select conversation">
+        {#each conversations as c}
+          <option value={c.id}>
+            {(c.title || 'Conversation')} | {displayWhen(c)} | {(c.message_count ?? 0)} msgs
+          </option>
+        {/each}
+      </select>
+      <button class="px-3 py-2 rounded-xl border border-gray-200 text-gray-600 text-xs hover:bg-gray-50" on:click={openSelectedConversation}>
+        Open
+      </button>
+    </div>
+  </div>
+{/if}

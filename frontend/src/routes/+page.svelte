@@ -44,6 +44,9 @@
 
   // ---------- PERSISTENCE ----------
   const LS_KEY = (u: string) => `acr:zipstate:${u}`;
+  // same format the ChatPanel uses for per-zip conversation id
+  const CONV_KEY = (u: string, fid: string) => `acr:conv:${u}:${fid}`;
+
   function persistState() {
     try {
       const data = { uploadedFileId, listLocation, folderSaved, zipBase };
@@ -61,6 +64,15 @@
       if (typeof d?.folderSaved === 'boolean') folderSaved = d.folderSaved;
     } catch {}
   }
+
+  // completely clear saved state (local + session) for a previous zip
+  function clearPersistedFor(prevZipId?: string | null) {
+    try { localStorage.removeItem(LS_KEY(userId)); } catch {}
+    if (prevZipId) {
+      try { sessionStorage.removeItem(CONV_KEY(userId, prevZipId)); } catch {}
+    }
+  }
+
   onMount(async () => {
     hydrateState();
 
@@ -90,7 +102,26 @@
     return `${(n / (1024 * 1024 * 1024)).toFixed(1)} GB`;
   }
 
-  function onPick(e: Event) {
+  /** 🔄 Hard reset EVERYTHING for a new zip selection */
+  function resetForNewZip() {
+    // pipeline + status
+    uploading = false; uploadMsg = null; uploadPct = 0; uploadedFileId = null;
+    extracting = false; extractMsg = null; extractLocation = null; unzipSpinnerTick = 0;
+    verifying = false; verifySpinnerTick = 0;
+
+    // listing
+    listBusy = false; listMsg = null; listLocation = ''; listLimit = 100; listPage = 1;
+    files = []; folders = []; pagination = []; totalCount = 0; lastListJson = null;
+
+    // LLM persistence
+    folderSaved = false; saving = false; saveMsg = null;
+
+    // UI toggles
+    showFolders = false; showFiles = false;
+  }
+
+  // ⬇️ auto-run the entire flow on file pick (no upload button)
+  async function onPick(e: Event) {
     const input = e.target as HTMLInputElement;
     const f = input.files?.[0] ?? null;
     if (f && !f.name.toLowerCase().endsWith('.zip')) {
@@ -99,29 +130,25 @@
       file = null;
       return;
     }
+
+    // remember old zip id to purge any persisted keys
+    const previousZipId = uploadedFileId;
+
+    // ensure full reset before applying new file state
+    resetForNewZip();
+
+    // purge local/session storage for the previous zip
+    clearPersistedFor(previousZipId || undefined);
+
     file = f;
-
     zipBase = f ? baseFromZip(f.name) : '';
-    uploadMsg = null;
-    uploadedFileId = null;
-    uploadPct = 0;
-    extractMsg = null;
-    extractLocation = null;
-    listLocation = '';
-    listMsg = null;
-    files = [];
-    folders = [];
-    lastListJson = null;
-
-    folderSaved = false;
-    saveMsg = null;
-    saving = false;
-
-    showFolders = false;
-    showFiles = false;
-    showJson = false;
 
     persistState();
+
+    // 👉 kick off upload & extract immediately
+    if (file) {
+      await uploadAndExtract();
+    }
   }
 
   function xhrPut(url: string, blob: Blob, onProgress: (p: number) => void): Promise<string> {
@@ -363,227 +390,267 @@
 
   let showFolders = false;
   let showFiles = false;
-  let showJson = false;
 
-  function stepClass(state: 'done'|'current'|'future') {
-    return state === 'done'
-      ? 'bg-green-100 text-green-800 ring-1 ring-green-200'
-      : state === 'current'
-      ? 'bg-gray-900 text-white'
-      : 'bg-gray-100 text-gray-600';
+  // ======= Shared “activity stripe” styling (match ChatPanel) =======
+  function eventBadgeClasses(t: string) {
+    if (t.includes('error')) return 'bg-rose-50 text-rose-800 border border-rose-100';
+    if (t.includes('complete')) return 'bg-emerald-50 text-emerald-800 border border-emerald-100';
+    if (t.includes('started') || t.includes('active')) return 'bg-sky-50 text-sky-800 border border-sky-100';
+    if (t === 'progress' || t === 'info') return 'bg-amber-50 text-amber-900 border border-amber-100';
+    return 'bg-gray-50 text-gray-800 border border-gray-100';
   }
-  function stepState(n: number): 'done'|'current'|'future' {
-    const s1 = !!uploadedFileId || uploading || extracting || verifying || !!extractLocation;
-    const s2 = !!extractLocation && !verifying;
-    const s3 = files.length > 0;
-    const s4 = folderSaved;
-    const s5 = folderSaved && !!uploadedFileId;
-    const states = [s1, s2, s3, s4, s5];
-    const idx = states.findIndex((ok) => !ok);
-    const current = idx === -1 ? 5 : idx + 1;
-    if (n < current && states[n-1]) return 'done';
-    if (n === current) return 'current';
-    return 'future';
+  function eventStripeClasses(t: string) {
+    if (t.includes('error')) return 'border-rose-100 bg-rose-50/60';
+    if (t.includes('complete')) return 'border-emerald-100 bg-emerald-50/60';
+    if (t.includes('started') || t.includes('active')) return 'border-sky-100 bg-sky-50/60';
+    if (t === 'progress' || t === 'info') return 'border-amber-100 bg-amber-50/60';
+    return 'border-gray-100 bg-gray-50/60';
   }
+
+  // ======= UI icons =======
+  const Icon = {
+    upload: () => `<svg viewBox="0 0 24 24" class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.7"><path stroke-linecap="round" stroke-linejoin="round" d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M12 12V4m0 0l-3 3m3-3l3 3"/></svg>`,
+    unzip: () => `<svg viewBox="0 0 24 24" class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.7"><path stroke-linecap="round" stroke-linejoin="round" d="M9 3h6l4 4v14a2 2 0 01-2 2H7a2 2 0 01-2-2V5a2 2 0 012-2z"/><path d="M12 7v10m-2-8h4m-4 4h4"/></svg>`,
+    verify: () => `<svg viewBox="0 0 24 24" class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.7"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4"/><path d="M12 22a10 10 0 110-20 10 10 0 010 20z"/></svg>`,
+    list:   () => `<svg viewBox="0 0 24 24" class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/></svg>`,
+    save:   () => `<svg viewBox="0 0 24 24" class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M17 3H5a2 2 0 00-2 2v14l4-4h10a2 2 0 002-2V5a2 2 0 00-2-2z"/></svg>`,
+  };
+
+  function stepBadge(status: 'idle'|'active'|'complete'|'error') {
+    return status === 'error'
+      ? eventBadgeClasses('error')
+      : status === 'complete'
+      ? eventBadgeClasses('complete')
+      : status === 'active'
+      ? eventBadgeClasses('active')
+      : eventBadgeClasses('info');
+  }
+  function stepStripe(status: 'idle'|'active'|'complete'|'error') {
+    return status === 'error'
+      ? eventStripeClasses('error')
+      : status === 'complete'
+      ? eventStripeClasses('complete')
+      : status === 'active'
+      ? eventStripeClasses('active')
+      : eventStripeClasses('info');
+  }
+
+  // step states
+  let uploadStatus: 'idle'|'active'|'complete'|'error';
+  $: uploadStatus =
+      uploading ? 'active'
+    : uploadMsg?.startsWith('Upload failed:') ? 'error'
+    : uploadedFileId ? 'complete'
+    : 'idle';
+
+  let unzipStatus: 'idle'|'active'|'complete'|'error';
+  $: unzipStatus =
+      extracting ? 'active'
+    : extractMsg?.startsWith('Extraction failed:') ? 'error'
+    : extractLocation ? 'complete'
+    : 'idle';
+
+  let verifyStatus: 'idle'|'active'|'complete'|'error';
+  $: verifyStatus =
+      verifying ? 'active'
+    : (!verifying && extractLocation) ? 'complete'
+    : 'idle';
+
+  let listStatus: 'idle'|'active'|'complete'|'error';
+  $: listStatus =
+      listBusy ? 'active'
+    : listMsg?.startsWith('List failed') ? 'error'
+    : (files.length + folders.length > 0) ? 'complete'
+    : 'idle';
+
+  let saveStatus: 'idle'|'active'|'complete'|'error';
+  $: saveStatus =
+      saving ? 'active'
+    : saveMsg?.startsWith('Save failed') ? 'error'
+    : folderSaved ? 'complete'
+    : 'idle';
+
+  // show stripes after pipeline begins or a prior session exists
+  let showPipeline: boolean;
+  $: showPipeline = !!(
+    uploading || extracting || verifying ||
+    uploadedFileId || extractLocation || saving || folderSaved ||
+    listBusy || files.length > 0 || folders.length > 0
+  );
 </script>
 
 <!-- Layout -->
 <div class="max-w-6xl mx-auto p-6 space-y-8">
-  <!-- Title + Stepper -->
-  <div class="space-y-3">
-    <div class="flex flex-col">
-      <h1 class="text-3xl font-semibold">AI Code Reviewer</h1>
-      <div class="text-xs text-gray-500 font-light italic">Powered by Trelae Files</div>
-    </div>
-
-    <!-- Stepper -->
-    <div class="flex flex-wrap gap-2">
-      <span class="text-xs px-2.5 py-1.5 rounded-full {stepClass(stepState(1))}">Upload</span>
-      <span class="text-xs px-2.5 py-1.5 rounded-full {stepClass(stepState(2))}">Unzip & Verify</span>
-      <span class="text-xs px-2.5 py-1.5 rounded-full {stepClass(stepState(3))}">Browse</span>
-      <span class="text-xs px-2.5 py-1.5 rounded-full {stepClass(stepState(4))}">Save</span>
-      <span class="text-xs px-2.5 py-1.5 rounded-full {stepClass(stepState(5))}">Analyze</span>
+  <!-- Title -->
+  <div class="space-y-1">
+    <div class="flex items-baseline gap-2">
+      <h1 class="text-3xl font-bold italic bg-gradient-to-r from-sky-400 to-emerald-400 bg-clip-text text-transparent tracking-tight">
+        Code Analyser
+      </h1>
+      <span class="text-[12px] font-light text-gray-400 italic">
+        Powered by Trelae Files
+      </span>
     </div>
   </div>
 
-  <!-- Upload / Extract card -->
-  <div class="border rounded-2xl p-5 space-y-4 bg-white">
-    <div class="space-y-3">
+  <!-- Connected Pipeline Card -->
+  <div class="border border-gray-300 rounded-2xl bg-white overflow-hidden">
 
-      <!-- Drop zone -->
-      <label
-        for="zip-file"
-        class="flex flex-col items-center justify-center w-full p-6 border border-dashed rounded-xl cursor-pointer 
-              hover:border-gray-400 hover:bg-gray-50 transition"
-      >
-        <svg class="w-10 h-10 text-gray-400 mb-2" fill="none" stroke="currentColor" stroke-width="2"
-            viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round"
-                d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6h.1a5 5 0 010 10h-1M12 12v9m0 0l-3-3m3 3l3-3"/>
-        </svg>
-        <p class="text-sm text-gray-600"><span class="font-medium">{file?.name || 'click to upload'}</span></p>
-        <p class="text-xs text-gray-400">Only zip files are supported</p>
-      </label>
-
-      <!-- Hidden input -->
-      <input id="zip-file" type="file" accept=".zip" class="hidden" on:change={onPick} />
-    </div>
-
-    <div class="flex flex-col gap-3">
-      <button
-        class="px-4 py-2 rounded-xl bg-gray-900 text-white font-medium hover:bg-black disabled:opacity-60 w-44"
-        on:click={uploadAndExtract}
-        disabled={!file || uploading || extracting || verifying}
-      >
-        {#if uploading}
-          Uploading
-        {:else if verifying}
-          Verifying file status
-        {:else if extracting}
-          Unzipping
-        {:else}
-          Upload & Extract
-        {/if}
-      </button>
-
-      <!-- Progress bar -->
-      {#if uploading}
-        <div class="flex items-center gap-2">
-          <div class="flex-1 h-2 bg-gray-200 rounded-full overflow-hidden">
-            <div class="h-2 bg-gray-900 transition-all" style={`width:${uploadPct}%;`}></div>
-          </div>
-          <div class="text-sm tabular-nums w-12 text-right">{uploadPct}%</div>
-        </div>
-      {/if}
-    </div>
-
-    {#if uploadMsg}<div class="text-sm text-green-700 italic">{uploadMsg}</div>{/if}
-    <!-- during unzip -->
-    {#if extracting}
-      <p class="text-sm text-gray-600 italic animate-pulse">Zip extracting…{'.'.repeat(unzipSpinnerTick)}</p>
-    {/if}
-    {#if extractMsg}
-      <div class="text-sm">
-        <span class="text-green-700">{extractMsg}</span>
-        {#if extractLocation}
-          <div class="text-xs text-gray-500 mt-1">Listing from:
-            <span class="font-mono">{listLocation || '(set after unzip)'}</span>
-          </div>
-        {/if}
-      </div>
-    {/if}
-    {#if verifying}
-      <p class="text-sm text-gray-600 italic animate-pulse">
-        Verifying file status…{'.'.repeat(verifySpinnerTick)}
-      </p>
-    {/if}
-
-    <!-- Manual list controls (pre-filled to extracted folder + zipBase) -->
-    {#if extractLocation && !verifying}
-      <div class="flex flex-wrap gap-2 items-center pt-2">
-        <input
-          class="flex-1 min-w-[280px] rounded-xl border px-3 py-2 text-sm"
-          bind:value={listLocation}
-          placeholder="CodeZips/<run>/<zipBase>"
-        />
-        <input class="w-20 rounded-xl border px-3 py-2 text-sm" type="number" min="1" max="100" bind:value={listLimit} />
-        <input class="w-20 rounded-xl border px-3 py-2 text-sm" type="number" min="1" bind:value={listPage} />
-        <button
-          class="px-3 py-2 rounded-xl border text-sm hover:bg-gray-50 disabled:opacity-60"
-          on:click={() => refreshList()}
-          disabled={listBusy}
+    <!-- Top: Upload controls (lighter borders; auto-start on choose) -->
+    <div class="p-4 pb-0">
+      <div class="space-y-3">
+        <label
+          for="zip-file"
+          class="flex flex-col items-center justify-center w-full p-6 border border-dashed border-gray-300 rounded-xl cursor-pointer 
+                 hover:border-gray-300 hover:bg-gray-50 transition"
         >
-          {listBusy ? 'Listing…' : 'Refresh List'}
-        </button>
-        {#if listMsg}<div class="text-sm text-gray-600">{listMsg}</div>{/if}
-      </div>
-    {/if}
-  </div>
+          <svg class="w-10 h-10 text-gray-400 mb-2" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round"
+                  d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6h.1a5 5 0 010 10h-1M12 12v9m0 0l-3-3m3 3l3-3"/>
+          </svg>
+          <p class="text-xs text-gray-600">
+            <span class="font-medium">{file?.name || 'Click to select a .zip'}</span>
+          </p>
+          <p class="text-xs text-gray-400 font-light">Upload & extract starts automatically</p>
+        </label>
+        <input id="zip-file" type="file" accept=".zip" class="hidden" on:change={onPick} />
 
-  <!-- Browse section (collapsibles) -->
-  <div class="space-y-3">
-    <!-- Folders -->
-    <div class="border rounded-2xl bg-white">
-      <button class="w-full flex items-center justify-between px-4 py-3 text-sm font-medium"
-        on:click={() => showFolders = !showFolders}>
-        <span>Extracted folders</span>
-        <span class="flex items-center gap-2 text-xs text-gray-600">
-          {folders.length} total
-          <svg class="w-4 h-4 transition-transform" style={`transform: rotate(${showFolders ? 180 : 0}deg);`} viewBox="0 0 20 20"><path d="M5 8l5 5 5-5H5z" /></svg>
-        </span>
-      </button>
-      {#if showFolders && folders.length}
-        <div class="px-4 pb-4">
-          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-            {#each folders as d}
-              <div class="border rounded-xl p-3 flex flex-col gap-2 bg-white">
+        <!-- Inline progress (no button) -->
+        {#if uploading}
+          <div class="flex items-center gap-2">
+            <div class="flex-1 h-2 bg-gray-200 rounded-full overflow-hidden">
+              <div class="h-2 bg-gray-900 transition-all" style={`width:${uploadPct}%;`}></div>
+            </div>
+            <div class="text-sm tabular-nums w-12 text-right">{uploadPct}%</div>
+          </div>
+        {/if}
+      </div>
+    </div>
+
+    <!-- Activity stripes: compact horizontal cards -->
+    {#if showPipeline}
+      <div class="p-4 font-light">
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2">
+          <!-- Upload -->
+          <div class={`p-3 rounded-xl border ${stepStripe(uploadStatus)} h-fit`}>
+            <div class="flex items-start gap-2">
+              <div class="mt-0.5 text-sky-700 shrink-0" aria-hidden="true">{@html Icon.upload()}</div>
+              <div class="min-w-0 flex-1 text-[13px]">
                 <div class="flex items-center justify-between gap-2">
-                  <div class="font-medium truncate" title={d.name}>📁 {d.name}</div>
-                  <span class="text-xs px-2 py-0.5 rounded-full bg-gray-100">folder</span>
+                  <span class={`font-mono text-[11px] px-2 py-0.5 rounded ${stepBadge(uploadStatus)}`}>upload_{uploadStatus}</span>
+                  <span class="text-[11px] text-gray-500 truncate">{file?.name || '—'}</span>
                 </div>
-                <div class="text-xs text-gray-600 break-all">
-                  <span class="font-semibold">Path:</span> {(d.location || '')}/{d.name}
-                </div>
-                <div class="mt-1">
-                  <button class="inline-flex items-center px-3 py-1.5 rounded-lg border text-sm hover:bg-gray-50" on:click={() => openFolder(d)}>Open</button>
+                <div class="mt-1 truncate">
+                  {#if uploadStatus === 'active'}Uploading zip… ({uploadPct}%)
+                  {:else if uploadStatus === 'complete'}{uploadMsg || 'Zip uploaded'}
+                  {:else if uploadStatus === 'error'}{uploadMsg}
+                  {:else}Waiting for a .zip file{/if}
                 </div>
               </div>
-            {/each}
+            </div>
+          </div>
+
+          <!-- Unzip -->
+          <div class={`p-3 rounded-xl border ${stepStripe(unzipStatus)} h-fit`}>
+            <div class="flex items-start gap-2">
+              <div class="mt-0.5 text-sky-700 shrink-0" aria-hidden="true">{@html Icon.unzip()}</div>
+              <div class="min-w-0 flex-1 text-[13px]">
+                <div class="flex items-center gap-2">
+                  <span class={`font-mono text-[11px] px-2 py-0.5 rounded ${stepBadge(unzipStatus)}`}>unzip_{unzipStatus}</span>
+                  {#if extracting}
+                    <span class="text-[11px] text-gray-500">working{'.'.repeat(unzipSpinnerTick)}</span>
+                  {/if}
+                </div>
+                <div class="mt-1 truncate">
+                  {#if unzipStatus === 'active'}Extracting files…
+                  {:else if unzipStatus === 'complete'}{extractMsg}
+                  {:else if unzipStatus === 'error'}{extractMsg}
+                  {:else}Standing by{/if}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Verify -->
+          <div class={`p-3 rounded-xl border ${stepStripe(verifyStatus)} h-fit`}>
+            <div class="flex items-start gap-2">
+              <div class="mt-0.5 text-sky-700 shrink-0" aria-hidden="true">{@html Icon.verify()}</div>
+              <div class="min-w-0 flex-1 text-[13px]">
+                <div class="flex items-center justify-between gap-2">
+                  <span class={`font-mono text-[11px] px-2 py-0.5 rounded ${stepBadge(verifyStatus)}`}>verify_{verifyStatus}</span>
+                  {#if verifying}
+                    <span class="text-[11px] text-gray-500">checking{'.'.repeat(verifySpinnerTick)}</span>
+                  {/if}
+                </div>
+                <div class="mt-1 truncate">
+                  {#if verifyStatus === 'active'}Verifying file status…
+                  {:else if verifyStatus === 'complete'}Ready
+                  {:else}Waiting{/if}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- List -->
+          <div class={`p-3 rounded-xl border ${stepStripe(listStatus)} h-full`}>
+            <div class="flex items-start gap-2">
+              <div class="mt-0.5 text-sky-700 shrink-0" aria-hidden="true">{@html Icon.list()}</div>
+              <div class="min-w-0 flex-1 text-[13px]">
+                <div class="flex items-center justify-between gap-2">
+                  <span class={`font-mono text-[11px] px-2 py-0.5 rounded ${stepBadge(listStatus)}`}>list_{listStatus}</span>
+                  <span class="text-[11px] text-gray-500 truncate">{listLocation || '—'}</span>
+                </div>
+                <div class="mt-1 truncate">
+                  {#if listStatus === 'active'}Listing extracted folder…
+                  {:else if listStatus === 'complete'}{listMsg}
+                  {:else if listStatus === 'error'}{listMsg}
+                  {:else}Run “Upload & Extract” first{/if}
+                </div>
+
+                <!-- compact advanced controls -->
+                {#if extractLocation}
+                  <details class="mt-2">
+                    <summary class="text-xs text-gray-600 cursor-pointer">advanced</summary>
+                    <div class="pt-2 flex flex-wrap gap-2 items-center">
+                      <input class="flex-1 min-w-[160px] rounded-xl border px-3 py-2 text-sm" bind:value={listLocation} placeholder="CodeZips/&lt;run&gt;/&lt;zipBase&gt;" />
+                      <input class="w-20 rounded-xl border px-3 py-2 text-sm" type="number" min="1" max="100" bind:value={listLimit} />
+                      <input class="w-20 rounded-xl border px-3 py-2 text-sm" type="number" min="1" bind:value={listPage} />
+                      <button class="px-3 py-2 rounded-xl border text-sm hover:bg-gray-50 disabled:opacity-60" on:click={() => refreshList()} disabled={listBusy}>
+                        {listBusy ? 'Listing…' : 'Refresh List'}
+                      </button>
+                    </div>
+                  </details>
+                {/if}
+              </div>
+            </div>
+          </div>
+
+          <!-- Save -->
+          <div class={`p-3 rounded-xl border ${stepStripe(saveStatus)} h-fit`}>
+            <div class="flex items-start gap-2">
+              <div class="mt-0.5 text-sky-700 shrink-0" aria-hidden="true">{@html Icon.save()}</div>
+              <div class="min-w-0 flex-1 text-[13px]">
+                <div class="flex items-center justify-between gap-2">
+                  <span class={`font-mono text-[11px] px-2 py-0.5 rounded ${stepBadge(saveStatus)}`}>save_{saveStatus}</span>
+                  <span class="text-[11px] text-gray-500 truncate">{uploadedFileId || '—'}</span>
+                </div>
+                <div class="mt-1 truncate">
+                  {#if saveStatus === 'active'}Saving project structure…
+                  {:else if saveStatus === 'complete'}{saveMsg || 'Structure saved'}
+                  {:else if saveStatus === 'error'}{saveMsg || 'Save failed'}
+                  {:else}Will save automatically after listing{/if}
+                </div>
+              </div>
+            </div>
           </div>
         </div>
-      {:else if showFolders}
-        <div class="px-4 pb-4 text-xs text-gray-500">No folders found.</div>
-      {/if}
-    </div>
-
-    <!-- Files -->
-    <div class="border rounded-2xl bg-white">
-      <button class="w-full flex items-center justify-between px-4 py-3 text-sm font-medium"
-        on:click={() => showFiles = !showFiles}>
-        <span>Extracted files</span>
-        <span class="flex items-center gap-2 text-xs text-gray-600">
-          {files.length} total
-          <svg class="w-4 h-4 transition-transform" style={`transform: rotate(${showFiles ? 180 : 0}deg);`} viewBox="0 0 20 20"><path d="M5 8l5 5 5-5H5z" /></svg>
-        </span>
-      </button>
-
-      {#if showFiles}
-        <div class="px-4 pb-4">
-          {#if files.length === 0}
-            <div class="text-sm text-gray-500">No files found in this extraction.</div>
-          {:else}
-            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-              {#each files as f, i}
-                <div class="border rounded-2xl p-3 flex flex-col gap-2 bg-white">
-                  <div class="flex items-center justify-between gap-2">
-                    <div class="font-medium truncate" title={f.name}>{f.name}</div>
-                    <span class="text-xs px-2 py-0.5 rounded-full bg-gray-100">{f.metadata?.fileType || 'unknown'}</span>
-                  </div>
-                  <div class="text-xs text-gray-600">
-                    <div><span class="font-semibold">Size:</span> {fmtSize(f.metadata?.size)}</div>
-                    <div class="break-all"><span class="font-semibold">Location:</span> {(f.location || listLocation)}/</div>
-                  </div>
-                  <div class="mt-1 flex gap-2">
-                    {#if f.url}
-                      <a class="inline-flex items-center px-3 py-1.5 rounded-lg border text-sm hover:bg-gray-50" href={f.url} target="_blank" rel="noreferrer">Download</a>
-                    {:else}
-                      <button class="inline-flex items-center px-3 py-1.5 rounded-lg border text-sm hover:bg-gray-50 disabled:opacity-60"
-                        on:click={() => getLink(i)} disabled={!!f._loading}>
-                        {#if f._loading}Getting link…{/if}{#if !f._loading}Get link{/if}
-                      </button>
-                    {/if}
-                    {#if f._err}<span class="text-xs text-red-700">{f._err}</span>{/if}
-                  </div>
-                </div>
-              {/each}
-            </div>
-          {/if}
-        </div>
-      {/if}
-    </div>
+      </div>
+    {:else}
+      <div class="p-0.5 text-xs text-gray-500"></div>
+    {/if}
   </div>
 
-  <!-- Chat Panel (analyze via chat) -->
+  <!-- Chat Panel -->
   <ChatPanel
     {backendUrl}
     {userId}
@@ -592,6 +659,91 @@
     {initialConversations}
     chatTitle={zipBase}
   />
+
+  <!-- Browse (end) -->
+  {#if extractLocation}
+    <div class="space-y-3">
+      <!-- Folders -->
+      <div class="border rounded-2xl bg-white">
+        <button class="w-full flex items-center justify-between px-4 py-3 text-sm font-medium"
+          on:click={() => showFolders = !showFolders}>
+          <span>Extracted folders</span>
+          <span class="flex items-center gap-2 text-xs text-gray-600">
+            {folders.length} total
+            <svg class="w-4 h-4 transition-transform" style={`transform: rotate(${showFolders ? 180 : 0}deg);`} viewBox="0 0 20 20"><path d="M5 8l5 5 5-5H5z" /></svg>
+          </span>
+        </button>
+        {#if showFolders && folders.length}
+          <div class="px-4 pb-4">
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+              {#each folders as d}
+                <div class="border rounded-2xl p-3 flex flex-col gap-2 bg-white">
+                  <div class="flex items-center justify-between gap-2">
+                    <div class="font-medium truncate" title={d.name}>📁 {d.name}</div>
+                    <span class="text-xs px-2 py-0.5 rounded-full bg-gray-100">folder</span>
+                  </div>
+                  <div class="text-xs text-gray-600 break-all">
+                    <span class="font-semibold">Path:</span> {(d.location || '')}/{d.name}
+                  </div>
+                  <div class="mt-1">
+                    <button class="inline-flex items-center px-3 py-1.5 rounded-lg border text-sm hover:bg-gray-50" on:click={() => openFolder(d)}>Open</button>
+                  </div>
+                </div>
+              {/each}
+            </div>
+          </div>
+        {:else if showFolders}
+          <div class="px-4 pb-4 text-xs text-gray-500">No folders found.</div>
+        {/if}
+      </div>
+
+      <!-- Files -->
+      <div class="border rounded-2xl bg-white">
+        <button class="w-full flex items-center justify-between px-4 py-3 text-sm font-medium"
+          on:click={() => showFiles = !showFiles}>
+          <span>Extracted files</span>
+          <span class="flex items-center gap-2 text-xs text-gray-600">
+            {files.length} total
+            <svg class="w-4 h-4 transition-transform" style={`transform: rotate(${showFiles ? 180 : 0}deg);`} viewBox="0 0 20 20"><path d="M5 8l5 5 5-5H5z" /></svg>
+          </span>
+        </button>
+
+        {#if showFiles}
+          <div class="px-4 pb-4">
+            {#if files.length === 0}
+              <div class="text-sm text-gray-500">No files found in this extraction.</div>
+            {:else}
+              <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                {#each files as f, i}
+                  <div class="border rounded-2xl p-3 flex flex-col gap-2 bg-white">
+                    <div class="flex items-center justify-between gap-2">
+                      <div class="font-medium truncate" title={f.name}>{f.name}</div>
+                      <span class="text-xs px-2 py-0.5 rounded-full bg-gray-100">{f.metadata?.fileType || 'unknown'}</span>
+                    </div>
+                    <div class="text-xs text-gray-600">
+                      <div><span class="font-semibold">Size:</span> {fmtSize(f.metadata?.size)}</div>
+                      <div class="break-all"><span class="font-semibold">Location:</span> {(f.location || listLocation)}/</div>
+                    </div>
+                    <div class="mt-1 flex gap-2">
+                      {#if f.url}
+                        <a class="inline-flex items-center px-3 py-1.5 rounded-lg border text-sm hover:bg-gray-50" href={f.url} target="_blank" rel="noreferrer">Download</a>
+                      {:else}
+                        <button class="inline-flex items-center px-3 py-1.5 rounded-lg border text-sm hover:bg-gray-50 disabled:opacity-60"
+                          on:click={() => getLink(i)} disabled={!!f._loading}>
+                          {#if f._loading}Getting link…{/if}{#if !f._loading}Get link{/if}
+                        </button>
+                      {/if}
+                      {#if f._err}<span class="text-xs text-red-700">{f._err}</span>{/if}
+                    </div>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        {/if}
+      </div>
+    </div>
+  {/if}
 </div>
 
 <style>
