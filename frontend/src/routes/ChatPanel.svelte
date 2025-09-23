@@ -134,6 +134,47 @@
   function sanitizeHtml(s: string) {
     return s.replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi,'').replace(/\son\w+="[^"]*"/gi,'').replace(/\son\w+='[^']*'/gi,'');
   }
+
+  // 👇 Detect & upgrade long signed/asset URLs into download buttons
+  function isDownloadUrl(u: string): boolean {
+    try {
+      const url = new URL(u);
+      const host = url.hostname.toLowerCase();
+      const qs = url.search.toLowerCase();
+      const looksSigned = qs.includes('expires=') || qs.includes('signature=') || qs.includes('key-pair-id=');
+      const isAssetHost = /cloudfront\.net|amazonaws\.com|blob\.core\.windows\.net|googleapis\.com/.test(host);
+      const longQuery = url.search.length > 30;
+      const hasExt = /\.[a-z0-9]+$/i.test(url.pathname);
+      return (looksSigned || isAssetHost || longQuery) && (hasExt || looksSigned);
+    } catch { return false; }
+  }
+  function fileNameFromUrl(u: string): string {
+    try {
+      const url = new URL(u);
+      const last = url.pathname.split('/').pop() || 'file';
+      return decodeURIComponent(last.replace(/\+/g, ' '));
+    } catch { return 'file'; }
+  }
+  function enhanceDownloadButtons(html: string): string {
+    return html.replace(/<a\s+([^>]*?)href="([^"]+)"([^>]*)>([\s\S]*?)<\/a>/gi, (_m, pre, href, post, inner) => {
+      if (!isDownloadUrl(href)) return _m;
+      const name = fileNameFromUrl(href);
+      // keep target/rel if present; otherwise set safe defaults
+      const hasTarget = /target=/.test(pre + post);
+      const hasRel = /rel=/.test(pre + post);
+      const target = hasTarget ? '' : ' target="_blank"';
+      const rel = hasRel ? '' : ' rel="noreferrer"';
+      return `<a href="${href}"${target}${rel}
+        class="inline-flex items-center text-xs gap-2 px-2 py-1.5 rounded-lg border border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 transition"
+      >
+        <svg viewBox="0 0 24 24" class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.8">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M12 3v12m0 0l-4-4m4 4l4-4M4 19h16"/>
+        </svg>
+        Download ${escapeHtml(name)}
+      </a>`;
+    });
+  }
+
   function mdToHtml(md: string) {
     let out = (md ?? '').replace(/\r\n?/g, '\n').trim();
     out = out.replace(/```([a-zA-Z0-9_-]+)?\n([\s\S]*?)```/g, (_m, lang, code) => {
@@ -156,11 +197,15 @@
     out = out.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noreferrer" class="underline">$1</a>');
     out = out.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
     out = out.replace(/(^|[^\*])\*(.*?)\*(?!\*)/g, '$1<em>$2</em>');
-    out = out.replace(/`([^`]+)`/g, '<code class="px-1 py-0.5 rounded bg-gray-100 border">$1</code>');
+    out = out.replace(/`([^`]+)`/g, '<code class="px-1 py-0.5 rounded bg-gray-50 border border-gray-100 text-pink-500">$1</code>');
     out = out.replace(/(^|\n)(?!\s*<)([^\n][\s\S]*?)(?=\n{2,}|$)/g, (_m, pfx, block) => {
       const html = String(block).trim().replace(/\n+/g, '<br />');
       return `${pfx}<p class="my-2">${html}</p>`;
     });
+
+    // 🔷 finally, upgrade raw anchors that look like download links into buttons
+    out = enhanceDownloadButtons(out);
+
     return sanitizeHtml(out.trim());
   }
 
