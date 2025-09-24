@@ -73,8 +73,31 @@
     }
   }
 
+  // infer extract root from saved list path (e.g. CodeZips/run/<zipBase>)
+  function deriveExtractLocation(loc: string, base: string) {
+    if (!loc) return null;
+    if (base && loc.endsWith('/' + base)) return loc.slice(0, -('/' + base).length);
+    const parts = loc.split('/').filter(Boolean);
+    return parts.length > 1 ? parts.slice(0, -1).join('/') : null;
+  }
+
   onMount(async () => {
     hydrateState();
+
+    // Reflect restored state immediately so badges don't show "Waiting"
+    if (uploadedFileId) {
+      uploadMsg = 'Zip File Uploaded ✓';
+    }
+    if (!extractLocation && listLocation) {
+      const maybeExtract = deriveExtractLocation(listLocation, zipBase);
+      if (maybeExtract) {
+        extractLocation = maybeExtract;
+        extractMsg = `Extracted to ${extractLocation}/`;
+      }
+    }
+    if (folderSaved) {
+      saveMsg = 'Structure saved ✓';
+    }
 
     // If we restored a fileId but don't know whether structure is saved, ask backend
     if (uploadedFileId && !folderSaved) {
@@ -84,8 +107,15 @@
         if (d?.exists) {
           folderSaved = true;
           if (!listLocation && d.rootLocation) listLocation = d.rootLocation;
+          saveMsg = 'Structure saved ✓';
         }
       } catch {}
+    }
+
+    // If we have a location, run a silent list to settle the List step
+    if (listLocation) {
+      listBusy = true;
+      await refreshList(false);
     }
   });
 
@@ -435,6 +465,14 @@
       : eventStripeClasses('info');
   }
 
+  // human-friendly status text
+  function prettyStatus(s: 'idle'|'active'|'complete'|'error') {
+    if (s === 'complete') return 'Complete';
+    if (s === 'active')   return 'Working';
+    if (s === 'error')    return 'Error';
+    return 'Waiting';
+  }
+
   // step states
   let uploadStatus: 'idle'|'active'|'complete'|'error';
   $: uploadStatus =
@@ -515,7 +553,6 @@
         </label>
         <input id="zip-file" type="file" accept=".zip" class="hidden" on:change={onPick} />
 
-        <!-- Inline progress (no button) -->
         {#if uploading}
           <div class="flex items-center gap-2">
             <div class="flex-1 h-2 bg-gray-200 rounded-full overflow-hidden">
@@ -527,7 +564,7 @@
       </div>
     </div>
 
-    <!-- Activity stripes: compact horizontal cards -->
+    <!-- Activity stripes -->
     {#if showPipeline}
       <div class="p-4 font-light">
         <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2">
@@ -536,12 +573,13 @@
             <div class="flex items-start gap-2">
               <div class="mt-0.5 text-sky-700 shrink-0" aria-hidden="true">{@html Icon.upload()}</div>
               <div class="min-w-0 flex-1 text-[13px]">
-                <div class="flex items-center justify-between gap-2">
-                  <span class={`font-mono text-[11px] px-2 py-0.5 rounded ${stepBadge(uploadStatus)}`}>upload_{uploadStatus}</span>
-                  <span class="text-[11px] text-gray-500 truncate">{file?.name || '—'}</span>
+                <!-- minimal header -->
+                <div class="flex items-center justify-between">
+                  <span class="text-[12px] font-medium text-gray-700">Upload</span>
+                  <span class={`text-[11px] px-2 py-0.5 rounded ${stepBadge(uploadStatus)}`}>{prettyStatus(uploadStatus)}</span>
                 </div>
                 <div class="mt-1 truncate text-xs">
-                  {#if uploadStatus === 'active'}Uploading zip… ({uploadPct}%)
+                  {#if uploadStatus === 'active'}Uploading… ({uploadPct}%)
                   {:else if uploadStatus === 'complete'}{uploadMsg || 'Zip uploaded'}
                   {:else if uploadStatus === 'error'}{uploadMsg}
                   {:else}Waiting for a .zip file{/if}
@@ -550,16 +588,14 @@
             </div>
           </div>
 
-          <!-- Unzip -->
+          <!-- Extract -->
           <div class={`p-3 rounded-xl border ${stepStripe(unzipStatus)} h-fit`}>
             <div class="flex items-start gap-2">
               <div class="mt-0.5 text-sky-700 shrink-0" aria-hidden="true">{@html Icon.unzip()}</div>
               <div class="min-w-0 flex-1 text-[13px]">
-                <div class="flex items-center gap-2">
-                  <span class={`font-mono text-[11px] px-2 py-0.5 rounded ${stepBadge(unzipStatus)}`}>unzip_{unzipStatus}</span>
-                  {#if extracting}
-                    <span class="text-[11px] text-gray-500">working{'.'.repeat(unzipSpinnerTick)}</span>
-                  {/if}
+                <div class="flex items-center justify-between">
+                  <span class="text-[12px] font-medium text-gray-700">Extract</span>
+                  <span class={`text-[11px] px-2 py-0.5 rounded ${stepBadge(unzipStatus)}`}>{prettyStatus(unzipStatus)}</span>
                 </div>
                 <div class="mt-1 truncate text-xs">
                   {#if unzipStatus === 'active'}Extracting files…
@@ -576,14 +612,12 @@
             <div class="flex items-start gap-2">
               <div class="mt-0.5 text-sky-700 shrink-0" aria-hidden="true">{@html Icon.verify()}</div>
               <div class="min-w-0 flex-1 text-[13px]">
-                <div class="flex items-center justify-between gap-2">
-                  <span class={`font-mono text-[11px] px-2 py-0.5 rounded ${stepBadge(verifyStatus)}`}>verify_{verifyStatus}</span>
-                  {#if verifying}
-                    <span class="text-[11px] text-gray-500">checking{'.'.repeat(verifySpinnerTick)}</span>
-                  {/if}
+                <div class="flex items-center justify-between">
+                  <span class="text-[12px] font-medium text-gray-700">Finalise</span>
+                  <span class={`text-[11px] px-2 py-0.5 rounded ${stepBadge(verifyStatus)}`}>{prettyStatus(verifyStatus)}</span>
                 </div>
                 <div class="mt-1 truncate text-xs">
-                  {#if verifyStatus === 'active'}Verifying file status…
+                  {#if verifyStatus === 'active'}Finalising file status…
                   {:else if verifyStatus === 'complete'}Ready
                   {:else}Waiting{/if}
                 </div>
@@ -596,18 +630,17 @@
             <div class="flex items-start gap-2">
               <div class="mt-0.5 text-sky-700 shrink-0" aria-hidden="true">{@html Icon.list()}</div>
               <div class="min-w-0 flex-1 text-[13px]">
-                <div class="flex items-center justify-between gap-2">
-                  <span class={`font-mono text-[11px] px-2 py-0.5 rounded ${stepBadge(listStatus)}`}>list_{listStatus}</span>
-                  <span class="text-[11px] text-gray-500 truncate">{listLocation || '—'}</span>
+                <div class="flex items-center justify-between">
+                  <span class="text-[12px] font-medium text-gray-700">List</span>
+                  <span class={`text-[11px] px-2 py-0.5 rounded ${stepBadge(listStatus)}`}>{prettyStatus(listStatus)}</span>
                 </div>
                 <div class="mt-1 truncate text-xs">
                   {#if listStatus === 'active'}Listing extracted folder…
                   {:else if listStatus === 'complete'}{listMsg || 'Files listed'}
                   {:else if listStatus === 'error'}{listMsg || 'List failed'}
-                  {:else}Files listed{/if}
+                  {:else}Waiting{/if}
                 </div>
 
-                <!-- compact advanced controls -->
                 {#if extractLocation}
                   <details class="mt-2">
                     <summary class="text-xs text-gray-600 cursor-pointer">advanced</summary>
@@ -630,9 +663,9 @@
             <div class="flex items-start gap-2">
               <div class="mt-0.5 text-sky-700 shrink-0" aria-hidden="true">{@html Icon.save()}</div>
               <div class="min-w-0 flex-1 text-[13px]">
-                <div class="flex items-center justify-between gap-2">
-                  <span class={`font-mono text-[11px] px-2 py-0.5 rounded ${stepBadge(saveStatus)}`}>save_{saveStatus}</span>
-                  <span class="text-[11px] text-gray-500 truncate">{uploadedFileId || '—'}</span>
+                <div class="flex items-center justify-between">
+                  <span class="text-[12px] font-medium text-gray-700">Save</span>
+                  <span class={`text-[11px] px-2 py-0.5 rounded ${stepBadge(saveStatus)}`}>{prettyStatus(saveStatus)}</span>
                 </div>
                 <div class="mt-1 truncate text-xs">
                   {#if saveStatus === 'active'}Saving project structure…
@@ -742,6 +775,45 @@
           </div>
         {/if}
       </div>
+    </div>
+  {/if}
+
+  {#if listLocation}
+    <div class="mt-6 flex justify-end">
+      <button
+        class="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border text-sm hover:bg-gray-50"
+        on:click={async (e) => {
+          const btn = e.currentTarget as HTMLButtonElement;
+          const original = btn.textContent;
+          btn.disabled = true;
+          btn.textContent = 'Zipping…';
+          try {
+            const res = await fetch('/ziplab', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                action: 'zipFolder',
+                location: listLocation,
+                zipName: `${(zipBase || 'archive').replace(/\s+/g, '-')}.zip`
+              })
+            });
+            const d = await res.json();
+            if (!res.ok || !d?.url) {
+              alert(d?.error || 'Failed to create zip');
+            } else {
+              window.open(d.url, '_blank', 'noopener,noreferrer');
+            }
+          } catch (err) {
+            alert((err as any)?.message || 'Zip failed');
+          } finally {
+            btn.disabled = false;
+            btn.textContent = original || 'Download Zip';
+          }
+        }}
+        title="Create a zip of the entire extracted folder"
+      >
+        Download Zip
+      </button>
     </div>
   {/if}
 </div>
