@@ -965,7 +965,7 @@ app.post("/ai/docs-analyzer/stream", async (req, res) => {
   const ping = setInterval(() => res.write(`: ping ${Date.now()}\n\n`), 15000);
 
   try {
-    send("analyse_started", { ts: Date.now(), message: "Initializing document analysis" });
+    send("analyse_started", { ts: Date.now(), message: "Beginning analysis of the document" });
 
     // DocAnalyzeBody must include: namespaceId, query, maxSnippets?, userId, docFileId, conversationId?
     const parsed = DocAnalyzeBody.safeParse(req.body);
@@ -1097,7 +1097,6 @@ app.post("/ai/docs-analyzer/stream", async (req, res) => {
       "Answer the user's query using ONLY the provided evidence snippets and the list of file names.",
       "Do NOT mention or infer any directory paths.",
       "When referring to a file, use only its file name (e.g., `sachin.txt`).",
-      "Cite evidence by [#index]. Keep the answer concise and actionable.",
     ].join("\n");
 
     const userPrompt = [
@@ -1109,6 +1108,7 @@ app.post("/ai/docs-analyzer/stream", async (req, res) => {
       "- If confident, answer with short bullets and [#indices].",
       "- If unsure, say what's missing and which file names to check next.",
       "- Never include directory paths.",
+      "-Never add [#1],[#2] text etc in the main respone because these are only for your reference purpose not to show to the user",
     ].join("\n");
 
     send("processing", { ts: Date.now(), message: "Analyzing content..." });

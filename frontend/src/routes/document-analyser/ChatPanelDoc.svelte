@@ -312,16 +312,6 @@
     return obj;
   }
 
-  function eventTitle(ev: StreamEvent): string {
-    const d = ev.data || {};
-    switch (ev.type) {
-      case 'analyse_started': return d.message || 'Starting analysis';
-      case 'processing': return d.message || 'Processing…';
-      case 'result': return d.message ? 'Result ready' : 'Result';
-      default: return d.message || ev.type;
-    }
-  }
-
   function eventBadgeClasses(t: string) {
     if (t.includes('error')) return 'bg-rose-100 text-rose-800 border border-rose-200';
     if (t === 'result') return 'bg-emerald-100 text-emerald-800 border border-emerald-200';
@@ -459,6 +449,7 @@
     } finally {
       connecting = false;
       persistConversation();
+      query = ""
     }
   }
 
@@ -488,6 +479,7 @@
   function onKey(e: KeyboardEvent) {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
+      // query=""
       runAnalysis();
     }
   }
@@ -573,10 +565,9 @@
                       </div>
                       <div class="min-w-0 flex-1">
                         <div class="flex items-center justify-between gap-2">
-                          <span class={`font-mono text-[11px] px-2 py-0.5 rounded ${eventBadgeClasses(ev.type)}`}>{ev.type}</span>
+                          <span class={`font-mono text-[11px] px-2 py-0.5 rounded ${eventBadgeClasses(ev.type)}`}>{ev.type.replace(/[_-]+/g, ' ').split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')}</span>
                           <span class="text-[11px] text-gray-500">{new Date(ev.time).toLocaleTimeString()}</span>
                         </div>
-                        <div class="mt-1">{eventTitle(ev)}</div>
                         {#if ev.data?.message && ev.type !== 'result'}
                           <div class="mt-1 text-[12px] text-gray-700">{ev.data.message}</div>
                         {/if}
@@ -654,10 +645,10 @@
       {/if}
     </div>
 
-    <div class="rounded-2xl border border-gray-200 bg-white p-3">
+    <div class="rounded-2xl border border-gray-200 bg-white p-3 h-[515px] overflow-y-auto">
       <div class="flex items-center justify-between">
-        <h3 class="text-sm font-medium text-gray-900">Evidence ({evidence.length})</h3>
-        <span class="text-[11px] text-gray-500">[#index]</span>
+        <h3 class="text-sm font-medium text-gray-900">Doc snippets ({evidence.length})</h3>
+        <!-- <span class="text-[11px] text-gray-500">[#index]</span> -->
       </div>
       {#if !evidence.length}
         <div class="text-xs text-gray-500 py-8 text-center">Citations appear after the first answer.</div>

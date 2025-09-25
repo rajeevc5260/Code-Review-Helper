@@ -4,6 +4,9 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+overrides:
+  trelae-files: link:../../trelae-files-js
+
 importers:
 
   .:
@@ -26,6 +29,9 @@ importers:
       pg:
         specifier: ^8.16.3
         version: 8.16.3
+      trelae-files:
+        specifier: link:../../trelae-files-js
+        version: link:../../trelae-files-js
       trelae-files-js:
         specifier: link:../../Library/pnpm/global/5/node_modules/trelae-files-js
         version: link:../../Library/pnpm/global/5/node_modules/trelae-files-js

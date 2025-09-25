@@ -399,7 +399,7 @@
                   </button>
 
                   {#if downloadUrl}
-                    <a class="px-3 py-1.5 rounded-xl border text-sm hover:bg-gray-100" href={downloadUrl} target="_blank" rel="noreferrer">
+                    <a class="px-2 py-1 rounded-xl border text-xs hover:bg-gray-100 disabled:opacity-60" href={downloadUrl} target="_blank" rel="noreferrer">
                       Open file
                     </a>
                   {/if}

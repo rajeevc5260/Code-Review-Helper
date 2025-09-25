@@ -33,6 +33,7 @@
     "drizzle-orm": "^0.44.5",
     "express": "^5.1.0",
     "pg": "^8.16.3",
+    "trelae-files": "link:../../trelae-files-js",
     "trelae-files-js": "link:../../Library/pnpm/global/5/node_modules/trelae-files-js",
     "zod": "^4.1.8"
   }
