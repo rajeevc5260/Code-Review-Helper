@@ -372,10 +372,7 @@ app.post("/ai/review/stream", async (req, res) => {
             return res.end();
         }
         const { userId, zipFileId, message, conversationId } = parsed.data;
-        sendProgress("Request validated successfully", { userId, zipFileId, messageLength: message.length, hasConversation: !!conversationId });
-
         if (!process.env.GEMINI_API_KEY) {
-            sendError("Configuration error - Missing Gemini API key");
             send("done", { status: "failed", timestamp: Date.now() });
             return res.end();
         }
@@ -940,6 +937,170 @@ app.get("/review/root-folder-id", async (req, res) => {
         res.status(500).json({ error: "Internal server error", details: err.message });
     }
 });
+
+
+const DocAnalyzeBody = z.object({
+    namespaceId: z.string().min(1),
+    query: z.string().min(3),
+    maxSnippets: z.number().int().min(1).max(20).optional(),
+});
+type DocAnalyzeBody = z.infer<typeof DocAnalyzeBody>;
+
+app.post("/ai/docs-analyzer/stream", async (req, res) => {
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    req.socket.setTimeout(0);
+    res.flushHeaders?.();
+
+    const send = (event: "analyse_started" | "processing" | "result", data: any) => {
+        const payload = typeof data === "string" ? data : JSON.stringify(data);
+        res.write(`event: ${event}\ndata: ${payload}\n\n`);
+    };
+    const ping = setInterval(() => res.write(`: ping ${Date.now()}\n\n`), 15000);
+
+    try {
+        send("analyse_started", { ts: Date.now(), message: "Initializing document analysis" });
+
+        const parsed = DocAnalyzeBody.safeParse(req.body);
+        if (!parsed.success) {
+            send("result", {
+                ts: Date.now(),
+                message: "Invalid request. Please provide a namespaceId and a query (min 3 chars).",
+                files: [],
+                evidence: [],
+            });
+            return res.end();
+        }
+        const { namespaceId, query, maxSnippets = 10 } = parsed.data;
+
+        if (!process.env.GEMINI_API_KEY) {
+            send("result", { ts: Date.now(), message: "Configuration error: GEMINI_API_KEY is missing.", files: [], evidence: [] });
+            return res.end();
+        }
+
+        let targetNs: any;
+        try {
+            targetNs = trelae.namespace(namespaceId);
+            await targetNs.getMetaData?.().catch(() => null);
+        } catch (e: any) {
+            return res.end();
+        }
+
+        let search;
+        try {
+            search = await targetNs.getFiles({
+                query,
+                content: { awareness: true, reRanking: false },
+            });
+        } catch (e: any) {
+            return res.end();
+        }
+
+        type LiteFile = { id: string; name: string; matches?: Array<{ snippet: string }> };
+        const files: LiteFile[] = (search?.files ?? []).map((f: any) => ({
+            id: String(f.id),
+            name: String(f.name || "").replace(/^\/+/, ""),
+            matches: Array.isArray(f?.matches) ? f.matches : undefined,
+        }));
+
+        const globalSnippets: Array<{ snippet: string }> = Array.isArray(search?.matches) ? search.matches : [];
+        const perFileSnippets: Array<{ snippet: string; fileId: string; name: string }> = files.flatMap((f) =>
+            (f.matches ?? []).map((m) => ({ snippet: m.snippet, fileId: f.id, name: f.name }))
+        );
+        const pool: Array<{ snippet: string; fileId?: string; name?: string }> = [
+            ...perFileSnippets,
+            ...globalSnippets,
+        ];
+
+        const qTokens = query.toLowerCase().split(/\s+/).filter(Boolean);
+        const scored = pool.map((m, idx) => {
+            const s = (m.snippet || "").toLowerCase();
+            const hits = qTokens.reduce((acc, t) => acc + (s.includes(t) ? 1 : 0), 0);
+            return { idx, hits, snippet: m.snippet || "", fileId: m.fileId, name: m.name };
+        }).sort((a, b) => b.hits - a.hits);
+
+        const used = scored.filter((x) => x.snippet.trim().length > 0).slice(0, maxSnippets);
+
+        const evidence = used.map((u, i) => ({
+            idx: i + 1,
+            snippet: u.snippet,
+            fileId: u.fileId || null,
+            fileName: u.name || null,
+        }));
+
+        const MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash-001";
+        const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+
+        const fileListForPrompt = files.slice(0, 200).map((f) => `- ${f.name} (id: ${f.id})`).join("\n");
+        const evidenceText = evidence.map((e) => `[#${e.idx}] ${e.snippet}`).join("\n\n");
+
+        const system = [
+            "You are an AI document analyst.",
+            "Answer the user's query using ONLY the provided evidence snippets and the list of file names.",
+            "Do NOT mention or infer any directory paths.",
+            "When referring to a file, use only its file name (e.g., `sachin.txt`).",
+            "Cite evidence by [#index]. Keep the answer concise and actionable.",
+        ].join("\n");
+
+        const userPrompt = [
+            `QUERY:\n${query}`,
+            "",
+            `FILES (names only):\n${fileListForPrompt || "_no files_"}\n`,
+            `EVIDENCE (${evidence.length} snippets):\n${evidenceText || "_no evidence_"}\n`,
+            "RESPONSE RULES:",
+            "- If confident, answer with short bullets and [#indices].",
+            "- If unsure, say what's missing and which file names to check next.",
+            "- Never include directory paths.",
+        ].join("\n");
+
+        send("processing", { ts: Date.now(), message: "Analyzing content..." });
+
+        const resp = await ai.models.generateContent({
+            model: MODEL,
+            contents: [
+                { role: "user", parts: [{ text: system }] },
+                { role: "user", parts: [{ text: userPrompt }] },
+            ],
+            config: { temperature: 0.2, maxOutputTokens: 1200 },
+        });
+
+        let text = (resp.text ?? "").trim();
+
+        const knownNames = new Set(files.map((f) => f.name));
+        if (text) {
+            for (const name of knownNames) {
+                const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                const withSlash = new RegExp("`?\\/" + escaped + "`?", "g");
+                text = text.replace(withSlash, `\`${name}\``);
+            }
+        } else {
+            text = "No sufficient evidence found to answer confidently. Try refining the query or provide more documents.";
+        }
+
+        send("result", {
+            ts: Date.now(),
+            message: text,
+            files: files.map((f) => ({ id: f.id, name: f.name })),
+            evidence,
+        });
+
+        res.end();
+    } catch (e: any) {
+        send("result", {
+            ts: Date.now(),
+            message: "A fatal error occurred during analysis.",
+            error: String(e?.message || e),
+            files: [],
+            evidence: [],
+        });
+        res.end();
+    } finally {
+        clearInterval(ping);
+    }
+});
+
   
 app.listen(PORT, () => {
     console.log(`Server running at http://localhost:${PORT}`);
