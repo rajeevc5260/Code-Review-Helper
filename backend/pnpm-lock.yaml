@@ -26,9 +26,9 @@ importers:
       pg:
         specifier: ^8.16.3
         version: 8.16.3
-      trelae-files:
-        specifier: ^0.1.8
-        version: 0.1.8
+      trelae-files-js:
+        specifier: link:../../Library/pnpm/global/5/node_modules/trelae-files-js
+        version: link:../../Library/pnpm/global/5/node_modules/trelae-files-js
       zod:
         specifier: ^4.1.8
         version: 4.1.8
@@ -920,9 +920,6 @@ packages:
   tr46@0.0.3:
     resolution: {integrity: sha512-N3WMsuqV66lT30CrXNbEjx4GEwlow3v6rr4mCcv6prnfwhS01rkgyFdjPNBYd9br7LpXV1+Emh01fHnq2Gdgrw==}
 
-  trelae-files@0.1.8:
-    resolution: {integrity: sha512-1X4d4I1Kh9Cu/t8BtK64v6rnTltegImjZr8nDIASkIzjXzoh13p/B9ko4RQUwrtSS1t3TuaC62PBwKauQdfmPw==}
-
   tsx@4.20.5:
     resolution: {integrity: sha512-+wKjMNU9w/EaQayHXb7WA7ZaHY6hN8WgfvHNQ3t1PnU91/7O8TcTnIhCDYTZwnt8JsO9IBqZ30Ln1r7pPF52Aw==}
     engines: {node: '>=18.0.0'}
@@ -1726,8 +1723,6 @@ snapshots:
   toidentifier@1.0.1: {}
 
   tr46@0.0.3: {}
-
-  trelae-files@0.1.8: {}
 
   tsx@4.20.5:
     dependencies:
