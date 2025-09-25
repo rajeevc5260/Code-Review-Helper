@@ -146,8 +146,8 @@
   async function loadConversationList() {
     if (!userId) return;
     try {
-      const qp = uploadedFileId ? `&docFileId=${encodeURIComponent(uploadedFileId)}&fileId=${encodeURIComponent(uploadedFileId)}` : '';
-      const url = `${backendUrl}/chat/conversations?userId=${encodeURIComponent(userId)}${qp}`;
+      const qp = uploadedFileId ? `&docFileId=${encodeURIComponent(uploadedFileId)}` : '';
+      const url = `${backendUrl}/doc-chat/conversations?userId=${encodeURIComponent(userId)}${qp}`;
       const r = await fetch(url);
       const d = await r.json();
       if (r.ok && Array.isArray(d?.conversations)) {
@@ -166,10 +166,14 @@
 
   async function startChat() {
     if (!uploadedFileId) return;
-    const r = await fetch(`${backendUrl}/chat/start`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      // send both names for backend compatibility
-      body: JSON.stringify({ userId, zipFileId: uploadedFileId, title: (chatTitle || '').trim() || undefined })
+    const r = await fetch(`${backendUrl}/doc-chat/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userId,
+        docFileId: uploadedFileId,
+        title: (chatTitle || '').trim() || undefined
+      })
     });
     const d = await r.json();
     if (!r.ok || !d?.conversationId) throw new Error(d?.error || 'Failed to start chat');
@@ -202,7 +206,7 @@
   async function loadMessages() {
     if (!conversationId) return;
     try {
-      const r = await fetch(`${backendUrl}/chat/${conversationId}/messages`);
+      const r = await fetch(`${backendUrl}/doc-chat/${conversationId}/messages`);
       const d = await r.json();
       const msgs: Msg[] = Array.isArray(d?.messages)
         ? d.messages.map((m:any) => ({ kind:'msg', role: m.role, content: m.content, createdAt: m.createdAt }))
@@ -399,12 +403,9 @@
           query: q,
           maxSnippets,
           userId,
-          // send both names for backend compatibility
-          uploadedFileId,
           docFileId: uploadedFileId,
-          fileId: uploadedFileId,
-          chatTitle,
-          conversationId
+          conversationId,
+          chatTitle
         })
       });
       if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}: ${res.statusText || 'no stream'}`);

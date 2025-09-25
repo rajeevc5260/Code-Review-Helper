@@ -12,7 +12,7 @@ import {
     type FunctionDeclaration,
     FunctionCallingConfigMode,
 } from "@google/genai";
-import { chatConversations, chatMessages, reviewZip } from "./db/schema.js";
+import { chatConversations, chatMessages, reviewZip, docChatConversations, docChatMessages } from "./db/schema.js";
 import { asc, eq, and } from "drizzle-orm";
 
 dotenv.config();
@@ -943,162 +943,312 @@ const DocAnalyzeBody = z.object({
     namespaceId: z.string().min(1),
     query: z.string().min(3),
     maxSnippets: z.number().int().min(1).max(20).optional(),
+    userId: z.string().min(1),
+    docFileId: z.string().min(1),
+    conversationId: z.string().optional(),
 });
 type DocAnalyzeBody = z.infer<typeof DocAnalyzeBody>;
 
+// Fully updated: persist doc-analyser messages to dedicated tables and load short history
 app.post("/ai/docs-analyzer/stream", async (req, res) => {
-    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-    res.setHeader("Cache-Control", "no-cache, no-transform");
-    res.setHeader("Connection", "keep-alive");
-    res.setHeader("X-Accel-Buffering", "no");
-    req.socket.setTimeout(0);
-    res.flushHeaders?.();
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  req.socket.setTimeout(0);
+  res.flushHeaders?.();
 
-    const send = (event: "analyse_started" | "processing" | "result", data: any) => {
-        const payload = typeof data === "string" ? data : JSON.stringify(data);
-        res.write(`event: ${event}\ndata: ${payload}\n\n`);
-    };
-    const ping = setInterval(() => res.write(`: ping ${Date.now()}\n\n`), 15000);
+  const send = (event: string, data: any) => {
+    const payload = typeof data === "string" ? data : JSON.stringify(data);
+    res.write(`event: ${event}\ndata: ${payload}\n\n`);
+  };
+  const ping = setInterval(() => res.write(`: ping ${Date.now()}\n\n`), 15000);
 
-    try {
-        send("analyse_started", { ts: Date.now(), message: "Initializing document analysis" });
+  try {
+    send("analyse_started", { ts: Date.now(), message: "Initializing document analysis" });
 
-        const parsed = DocAnalyzeBody.safeParse(req.body);
-        if (!parsed.success) {
-            send("result", {
-                ts: Date.now(),
-                message: "Invalid request. Please provide a namespaceId and a query (min 3 chars).",
-                files: [],
-                evidence: [],
-            });
-            return res.end();
-        }
-        const { namespaceId, query, maxSnippets = 10 } = parsed.data;
-
-        if (!process.env.GEMINI_API_KEY) {
-            send("result", { ts: Date.now(), message: "Configuration error: GEMINI_API_KEY is missing.", files: [], evidence: [] });
-            return res.end();
-        }
-
-        let targetNs: any;
-        try {
-            targetNs = trelae.namespace(namespaceId);
-            await targetNs.getMetaData?.().catch(() => null);
-        } catch (e: any) {
-            return res.end();
-        }
-
-        let search;
-        try {
-            search = await targetNs.getFiles({
-                query,
-                content: { awareness: true, reRanking: true },
-            });
-        } catch (e: any) {
-            return res.end();
-        }
-
-        type LiteFile = { id: string; name: string; matches?: Array<{ snippet: string }> };
-        const files: LiteFile[] = (search?.files ?? []).map((f: any) => ({
-            id: String(f.id),
-            name: String(f.name || "").replace(/^\/+/, ""),
-            matches: Array.isArray(f?.matches) ? f.matches : undefined,
-        }));
-
-        const globalSnippets: Array<{ snippet: string }> = Array.isArray(search?.matches) ? search.matches : [];
-        const perFileSnippets: Array<{ snippet: string; fileId: string; name: string }> = files.flatMap((f) =>
-            (f.matches ?? []).map((m) => ({ snippet: m.snippet, fileId: f.id, name: f.name }))
-        );
-        const pool: Array<{ snippet: string; fileId?: string; name?: string }> = [
-            ...perFileSnippets,
-            ...globalSnippets,
-        ];
-
-        const qTokens = query.toLowerCase().split(/\s+/).filter(Boolean);
-        const scored = pool.map((m, idx) => {
-            const s = (m.snippet || "").toLowerCase();
-            const hits = qTokens.reduce((acc, t) => acc + (s.includes(t) ? 1 : 0), 0);
-            return { idx, hits, snippet: m.snippet || "", fileId: m.fileId, name: m.name };
-        }).sort((a, b) => b.hits - a.hits);
-
-        const used = scored.filter((x) => x.snippet.trim().length > 0).slice(0, maxSnippets);
-
-        const evidence = used.map((u, i) => ({
-            idx: i + 1,
-            snippet: u.snippet,
-            fileId: u.fileId || null,
-            fileName: u.name || null,
-        }));
-
-        const MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash-001";
-        const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
-
-        const fileListForPrompt = files.slice(0, 200).map((f) => `- ${f.name} (id: ${f.id})`).join("\n");
-        const evidenceText = evidence.map((e) => `[#${e.idx}] ${e.snippet}`).join("\n\n");
-
-        const system = [
-            "You are an AI document analyst.",
-            "Answer the user's query using ONLY the provided evidence snippets and the list of file names.",
-            "Do NOT mention or infer any directory paths.",
-            "When referring to a file, use only its file name (e.g., `sachin.txt`).",
-            "Cite evidence by [#index]. Keep the answer concise and actionable.",
-        ].join("\n");
-
-        const userPrompt = [
-            `QUERY:\n${query}`,
-            "",
-            `FILES (names only):\n${fileListForPrompt || "_no files_"}\n`,
-            `EVIDENCE (${evidence.length} snippets):\n${evidenceText || "_no evidence_"}\n`,
-            "RESPONSE RULES:",
-            "- If confident, answer with short bullets and [#indices].",
-            "- If unsure, say what's missing and which file names to check next.",
-            "- Never include directory paths.",
-        ].join("\n");
-
-        send("processing", { ts: Date.now(), message: "Analyzing content..." });
-
-        const resp = await ai.models.generateContent({
-            model: MODEL,
-            contents: [
-                { role: "user", parts: [{ text: system }] },
-                { role: "user", parts: [{ text: userPrompt }] },
-            ],
-            config: { temperature: 0.2, maxOutputTokens: 1200 },
-        });
-
-        let text = (resp.text ?? "").trim();
-
-        const knownNames = new Set(files.map((f) => f.name));
-        if (text) {
-            for (const name of knownNames) {
-                const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-                const withSlash = new RegExp("`?\\/" + escaped + "`?", "g");
-                text = text.replace(withSlash, `\`${name}\``);
-            }
-        } else {
-            text = "No sufficient evidence found to answer confidently. Try refining the query or provide more documents.";
-        }
-
-        send("result", {
-            ts: Date.now(),
-            message: text,
-            files: files.map((f) => ({ id: f.id, name: f.name })),
-            evidence,
-        });
-
-        res.end();
-    } catch (e: any) {
-        send("result", {
-            ts: Date.now(),
-            message: "A fatal error occurred during analysis.",
-            error: String(e?.message || e),
-            files: [],
-            evidence: [],
-        });
-        res.end();
-    } finally {
-        clearInterval(ping);
+    // DocAnalyzeBody must include: namespaceId, query, maxSnippets?, userId, docFileId, conversationId?
+    const parsed = DocAnalyzeBody.safeParse(req.body);
+    if (!parsed.success) {
+      send("result", {
+        ts: Date.now(),
+        message: "Invalid request. Please provide namespaceId, userId, docFileId and a query (min 3 chars).",
+        files: [],
+        evidence: [],
+      });
+      return res.end();
     }
+
+    const {
+      namespaceId,
+      query,
+      maxSnippets = 10,
+      userId,
+      docFileId,
+      conversationId,
+    } = parsed.data;
+
+    if (!process.env.GEMINI_API_KEY) {
+      send("result", {
+        ts: Date.now(),
+        message: "Configuration error: GEMINI_API_KEY is missing.",
+        files: [],
+        evidence: [],
+      });
+      return res.end();
+    }
+
+    // Resolve namespace
+    let targetNs: any;
+    try {
+      targetNs = trelae.namespace(namespaceId);
+      await targetNs.getMetaData?.().catch(() => null);
+    } catch {
+      send("result", { ts: Date.now(), message: "Invalid namespace.", files: [], evidence: [] });
+      return res.end();
+    }
+
+    // Vector/semantic search
+    let search;
+    try {
+      search = await targetNs.getFiles({
+        query,
+        content: { awareness: true, reRanking: true },
+      });
+    } catch {
+      send("result", { ts: Date.now(), message: "Search failed.", files: [], evidence: [] });
+      return res.end();
+    }
+
+    type LiteFile = { id: string; name: string; matches?: Array<{ snippet: string }> };
+    const files: LiteFile[] = (search?.files ?? []).map((f: any) => ({
+      id: String(f.id),
+      name: String(f.name || "").replace(/^\/+/, ""),
+      matches: Array.isArray(f?.matches) ? f.matches : undefined,
+    }));
+
+    const globalSnippets: Array<{ snippet: string }> = Array.isArray(search?.matches) ? search.matches : [];
+    const perFileSnippets: Array<{ snippet: string; fileId: string; name: string }> = files.flatMap((f) =>
+      (f.matches ?? []).map((m) => ({ snippet: m.snippet, fileId: f.id, name: f.name }))
+    );
+    const pool: Array<{ snippet: string; fileId?: string; name?: string }> = [
+      ...perFileSnippets,
+      ...globalSnippets,
+    ];
+
+    const qTokens = query.toLowerCase().split(/\s+/).filter(Boolean);
+    const scored = pool
+      .map((m, idx) => {
+        const s = (m.snippet || "").toLowerCase();
+        const hits = qTokens.reduce((acc, t) => acc + (s.includes(t) ? 1 : 0), 0);
+        return { idx, hits, snippet: m.snippet || "", fileId: m.fileId, name: m.name };
+      })
+      .sort((a, b) => b.hits - a.hits);
+
+    const used = scored.filter((x) => x.snippet.trim().length > 0).slice(0, maxSnippets);
+
+    const evidence = used.map((u, i) => ({
+      idx: i + 1,
+      snippet: u.snippet,
+      fileId: u.fileId || null,
+      fileName: u.name || null,
+    }));
+
+    // ===== Conversation persistence (doc-only tables) =====
+    let priorTurns: Array<{ role: "user" | "assistant"; content: string }> = [];
+    if (conversationId) {
+      try {
+        const rows = await db
+          .select({ role: docChatMessages.role, content: docChatMessages.content })
+          .from(docChatMessages)
+          .where(eq(docChatMessages.conversationId, conversationId))
+          .orderBy(asc(docChatMessages.createdAt));
+        priorTurns = rows
+          .map((r) => ({ role: r.role === "assistant" ? ("assistant" as const) : ("user" as const), content: r.content }))
+          .slice(-5);
+        if (rows.length) send("history_loaded", { ts: Date.now(), message: `Loaded ${rows.length} prior messages` });
+      } catch (e: any) {
+        send("history_error", { ts: Date.now(), message: "Failed to load prior messages", error: e?.message || String(e) });
+      }
+      try {
+        await db.insert(docChatMessages).values({
+          id: randomUUID(),
+          conversationId,
+          userId,
+          role: "user",
+          content: query,
+          metadata: { source: "doc-analyzer", docFileId },
+        });
+        send("message_saved", { ts: Date.now(), role: "user" });
+      } catch (e: any) {
+        send("message_save_error", { ts: Date.now(), message: "Failed to save user message", error: e?.message || String(e) });
+      }
+    }
+
+    // ===== LLM call =====
+    const MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash-001";
+    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+
+    const fileListForPrompt = files.slice(0, 200).map((f) => `- ${f.name} (id: ${f.id})`).join("\n");
+    const evidenceText = evidence.map((e) => `[#${e.idx}] ${e.snippet}`).join("\n\n");
+
+    const system = [
+      "You are an AI document analyst.",
+      "Answer the user's query using ONLY the provided evidence snippets and the list of file names.",
+      "Do NOT mention or infer any directory paths.",
+      "When referring to a file, use only its file name (e.g., `sachin.txt`).",
+      "Cite evidence by [#index]. Keep the answer concise and actionable.",
+    ].join("\n");
+
+    const userPrompt = [
+      `QUERY:\n${query}`,
+      "",
+      `FILES (names only):\n${fileListForPrompt || "_no files_"}\n`,
+      `EVIDENCE (${evidence.length} snippets):\n${evidenceText || "_no evidence_"}\n`,
+      "RESPONSE RULES:",
+      "- If confident, answer with short bullets and [#indices].",
+      "- If unsure, say what's missing and which file names to check next.",
+      "- Never include directory paths.",
+    ].join("\n");
+
+    send("processing", { ts: Date.now(), message: "Analyzing content..." });
+
+    // Build chat history for Gemini
+    const historyParts: any[] = [{ role: "user", parts: [{ text: system }] }];
+    for (const t of priorTurns) {
+      historyParts.push(
+        t.role === "user"
+          ? { role: "user", parts: [{ text: t.content }] }
+          : { role: "model", parts: [{ text: t.content }] }
+      );
+    }
+    historyParts.push({ role: "user", parts: [{ text: userPrompt }] });
+
+    const resp = await ai.models.generateContent({
+      model: MODEL,
+      contents: historyParts,
+      config: { temperature: 0.2, maxOutputTokens: 1200 },
+    });
+
+    let text = (resp.text ?? "").trim();
+
+    // Normalize any accidental `/filename` mentions back to `filename`
+    const knownNames = new Set(files.map((f) => f.name));
+    if (text) {
+      for (const name of knownNames) {
+        const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const withSlash = new RegExp("`?\\/" + escaped + "`?", "g");
+        text = text.replace(withSlash, `\`${name}\``);
+      }
+    } else {
+      text = "No sufficient evidence found to answer confidently. Try refining the query or provide more documents.";
+    }
+
+    // Save assistant message to doc messages (if in a conversation)
+    if (conversationId) {
+      try {
+        await db.insert(docChatMessages).values({
+          id: randomUUID(),
+          conversationId,
+          userId,
+          role: "assistant",
+          content: text,
+          metadata: {
+            filesReturned: Array.isArray(files) ? files.length : 0,
+            evidenceCount: Array.isArray(evidence) ? evidence.length : 0,
+            finishedAt: new Date().toISOString(),
+          },
+        });
+        send("message_saved", { ts: Date.now(), role: "assistant" });
+      } catch (e: any) {
+        send("message_save_error", { ts: Date.now(), message: "Failed to save assistant message", error: e?.message || String(e) });
+      }
+    }
+
+    // Final payload to client
+    send("result", {
+      ts: Date.now(),
+      message: text,
+      files: files.map((f) => ({ id: f.id, name: f.name })),
+      evidence,
+    });
+
+    res.end();
+  } catch (e: any) {
+    send("result", {
+      ts: Date.now(),
+      message: "A fatal error occurred during analysis.",
+      error: String(e?.message || e),
+      files: [],
+      evidence: [],
+    });
+    res.end();
+  } finally {
+    clearInterval(ping);
+  }
+});
+
+// list doc conversations (optional filter by docFileId)
+app.get("/doc-chat/conversations", async (req, res) => {
+  const { userId, docFileId } = req.query as { userId?: string; docFileId?: string };
+  if (!userId) return res.status(400).json({ error: "userId required" });
+
+  try {
+    const params: any[] = [userId];
+    let filterDoc = "";
+    if (docFileId) { params.push(docFileId); filterDoc = "AND c.doc_file_id = $2"; }
+
+    const q = `
+      SELECT c.id, c.user_id, c.doc_file_id, c.title, c.created_at, c.updated_at,
+             MAX(m.created_at) AS last_message_at, COUNT(m.id) AS message_count
+      FROM doc_chat_conversations c
+      LEFT JOIN doc_chat_messages m ON m.conversation_id = c.id
+      WHERE c.user_id = $1 ${filterDoc}
+      GROUP BY c.id
+      ORDER BY COALESCE(MAX(m.created_at), c.created_at) DESC
+      LIMIT 100
+    `;
+    const r = await pool.query(q, params);
+    res.json({ conversations: r.rows });
+  } catch (e: any) {
+    res.status(500).json({ error: e?.message || "failed" });
+  }
+});
+
+// start a doc chat
+app.post("/doc-chat/start", async (req, res) => {
+  const { userId, docFileId, title } = req.body || {};
+  if (!userId || !docFileId) {
+    return res.status(400).json({ error: "userId and docFileId are required" });
+  }
+  try {
+    const id = randomUUID();
+    await db.insert(docChatConversations).values({
+      id,
+      userId,
+      docFileId,
+      title: (typeof title === "string" && title.trim()) ? title.trim() : "New chat",
+    });
+    return res.status(201).json({ conversationId: id });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || "Failed to start doc chat" });
+  }
+});
+
+// load doc chat messages
+app.get("/doc-chat/:conversationId/messages", async (req, res) => {
+  const { conversationId } = req.params;
+  if (!conversationId) return res.status(400).json({ error: "conversationId required" });
+  try {
+    const rows = await db
+      .select()
+      .from(docChatMessages)
+      .where(eq(docChatMessages.conversationId, conversationId))
+      .orderBy(asc(docChatMessages.createdAt));
+    return res.json({ messages: rows });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || "Failed to load messages" });
+  }
 });
 
   
