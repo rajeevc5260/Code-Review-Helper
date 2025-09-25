@@ -992,7 +992,7 @@ app.post("/ai/docs-analyzer/stream", async (req, res) => {
         try {
             search = await targetNs.getFiles({
                 query,
-                content: { awareness: true, reRanking: false },
+                content: { awareness: true, reRanking: true },
             });
         } catch (e: any) {
             return res.end();
