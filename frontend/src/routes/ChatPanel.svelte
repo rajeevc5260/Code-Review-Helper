@@ -536,7 +536,7 @@
         rows="2"
         placeholder={
           !folderSaved
-            ? "Project structure missing — read-only. Open a past conversation to view history."
+            ? "To start chating upload your code Repo zip file"
             : (conversationId ? "Shift+Enter = newline • Enter = send" : "Start the chat first")
         }
         bind:value={input}

@@ -522,7 +522,7 @@
   <!-- Title -->
   <div class="space-y-1">
     <div class="flex items-baseline gap-2">
-      <h1 class="text-3xl font-bold italic bg-gradient-to-r from-sky-400 to-emerald-400 bg-clip-text text-transparent tracking-tight">
+      <h1 class="text-3xl font-bold italic text-slate-800 bg-clip-text tracking-tight">
         Code Analyser
       </h1>
       <span class="text-[12px] font-light text-gray-400 italic">
